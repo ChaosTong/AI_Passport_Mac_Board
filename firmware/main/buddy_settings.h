@@ -16,6 +16,10 @@ esp_err_t buddy_settings_set_name_committed(const char *name);
 esp_err_t buddy_settings_set_owner_committed(const char *owner);
 esp_err_t buddy_settings_set_ble_enabled(bool enabled);
 esp_err_t buddy_settings_set_sound_enabled(bool enabled);
+/** 音量档位（0–100 吸附到 0/50/100），只改内存；值变化才标脏，由调用方 buddy_settings_flush(true)。 */
+esp_err_t buddy_settings_set_volume(uint8_t volume);
+/* 0 音乐 / 1 编译 / 2 音量；值变化才标脏 */
+esp_err_t buddy_settings_set_macboard_page(uint8_t page);
 esp_err_t buddy_settings_set_highest_celebrated_level(uint64_t level);
 void buddy_settings_record_permission(buddy_permission_decision_t decision);
 esp_err_t buddy_settings_flush(bool force);

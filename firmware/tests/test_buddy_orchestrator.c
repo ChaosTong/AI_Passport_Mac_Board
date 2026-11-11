@@ -218,8 +218,34 @@ static void test_executor_orders_sensitive_side_effects(void)
     assert(!fake.ble_enabled);
 }
 
+static void test_sound_command_queues_preview_and_acks(void)
+{
+    fake_runtime_t fake = {.commit_result = ESP_OK, .secure = true};
+    buddy_orchestrator_ops_t ops = fake_ops(&fake);
+    buddy_state_t state;
+    buddy_action_t action;
+    const char *ok_json = "{\"cmd\":\"sound\",\"name\":\"build_failure\"}";
+    const char *bad_json = "{\"cmd\":\"sound\",\"name\":\"nope\"}";
+
+    buddy_state_init(&state, NULL);
+    state.settings.sound_enabled = false; /* 试听忽略 SOUND 开关 */
+    assert(buddy_orchestrator_process_rx(&state, &ops, ok_json, strlen(ok_json), 7, 1000,
+                                         &action));
+    assert(state.build_sound_pending == 2U);
+    assert(state.build_sound_force);
+    assert(strcmp(fake.sent, "{\"ack\":\"sound\",\"ok\":true}\n") == 0);
+
+    state.build_sound_pending = 0U;
+    state.build_sound_force = false;
+    assert(!buddy_orchestrator_process_rx(&state, &ops, bad_json, strlen(bad_json), 7, 1001,
+                                          &action));
+    assert(state.build_sound_pending == 0U);
+    assert(strcmp(fake.sent, "{\"ack\":\"sound\",\"ok\":false,\"error\":\"unknown sound\"}\n") == 0);
+}
+
 int main(void)
 {
+    test_sound_command_queues_preview_and_acks();
     test_official_rx_fixtures_reach_state_and_responses();
     test_failed_setting_commit_sends_error_ack_without_state_change();
     test_executor_orders_sensitive_side_effects();

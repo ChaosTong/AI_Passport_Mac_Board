@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,6 +22,7 @@
 #include "bsp_pins.h"
 #include "buddy_app_logic.h"
 #include "buddy_ble.h"
+#include "buddy_macboard.h"
 #include "buddy_orchestrator.h"
 #include "buddy_protocol.h"
 #include "buddy_settings.h"
@@ -315,6 +317,13 @@ static void buddy_queue_rx_line(const buddy_ble_event_t *event)
         buddy_apply_rx_retry_counts(&retry);
         buddy_notify_app();
     }
+}
+
+/* MacBoard 没有 SOUND 开关入口了（旧 SETTINGS 已移除）：提示音只由音量页控制（0 = 静音）。
+ * 独立 Claude Buddy 模式仍按 SOUND 设置。 */
+static bool buddy_cues_enabled(const buddy_state_t *state)
+{
+    return state->macboard_companion || state->settings.sound_enabled;
 }
 
 static void on_key(bsp_btn_t button, bsp_btn_ev_t event, void *context)
@@ -810,7 +819,7 @@ static bool buddy_execute_action(buddy_state_t *state, const buddy_action_t *act
         return false;
     }
     if (action->type == BUDDY_ACTION_SOUND_CUE) {
-        if (state->settings.sound_enabled) {
+        if (buddy_cues_enabled(state)) {
             buddy_sound_play_attention();
         }
         memset(result_event, 0, sizeof(*result_event));
@@ -973,8 +982,12 @@ static void buddy_app_task(void *context)
 
             if (xQueueReceive(ready, &control, 0) == pdTRUE &&
                 buddy_control_to_event(&control, &state, &event)) {
+                const int prev_page = (int)state.page;
                 buddy_state_reduce(&state, &event, now_ms, &action);
-                if (state.macboard_companion && state.settings.sound_enabled &&
+                if ((int)state.page != prev_page) {
+                    ESP_LOGI(TAG, "page %d -> %d (key)", prev_page, (int)state.page);
+                }
+                if (state.macboard_companion &&
                     event.type == BUDDY_EVENT_KEY_CLICK) {
                     buddy_sound_play_click();
                 }
@@ -984,7 +997,11 @@ static void buddy_app_task(void *context)
             buddy_rx_slot_t *slot = NULL;
 
             if (xQueueReceive(ready, &slot, 0) == pdTRUE && slot != NULL) {
+                const int prev_page = (int)state.page;
                 reduced = buddy_handle_rx(&state, slot, &event, now_ms, &action);
+                if ((int)state.page != prev_page) {
+                    ESP_LOGI(TAG, "page %d -> %d (mac)", prev_page, (int)state.page);
+                }
                 buddy_rx_slot_release(slot);
             }
         }
@@ -996,6 +1013,60 @@ static void buddy_app_task(void *context)
 
         if (buddy_execute_action(&state, &action, &event)) {
             buddy_state_reduce(&state, &event, now_ms, &action);
+        }
+        if (state.macboard_companion &&
+            (state.page == BUDDY_PAGE_MUSIC || state.page == BUDDY_PAGE_BUILD ||
+             state.page == BUDDY_PAGE_VOLUME)) {
+            /* 板子是当前页的唯一来源：切页后记到 NVS（值变化才写），重启 / 重连回到这一页 */
+            const uint8_t page_setting = buddy_macboard_page_to_setting(state.page);
+
+            if (page_setting != state.settings.macboard_page) {
+                state.settings.macboard_page = page_setting;
+                if (buddy_settings_set_macboard_page(page_setting) == ESP_OK &&
+                    buddy_settings_flush(true) == ESP_OK) {
+                    ESP_LOGI(TAG, "page %u saved", (unsigned)page_setting);
+                } else {
+                    ESP_LOGW(TAG, "page %u save failed", (unsigned)page_setting);
+                }
+            }
+        }
+        if (state.volume_commit_pending) {
+            /* 音量页 OK：应用到 codec；值变化才写 NVS；按新音量试听（0 = 静音不出声） */
+            const uint8_t level = buddy_volume_snap(state.settings.volume);
+            const uint8_t previous = buddy_sound_volume();
+
+            state.volume_commit_pending = false;
+            state.settings.volume = level;
+            buddy_sound_set_volume(level);
+            if (level != previous) {
+                if (buddy_settings_set_volume(level) == ESP_OK &&
+                    buddy_settings_flush(true) == ESP_OK) {
+                    ESP_LOGI(TAG, "volume %u -> %u (saved)", (unsigned)previous, (unsigned)level);
+                } else {
+                    ESP_LOGW(TAG, "volume %u -> %u (save failed)", (unsigned)previous,
+                             (unsigned)level);
+                }
+            } else {
+                ESP_LOGI(TAG, "volume %u unchanged", (unsigned)level);
+            }
+            buddy_sound_play_attention();
+        }
+        if (state.build_sound_pending != BUDDY_BUILD_SOUND_NONE) {
+            const bool ok = state.build_sound_pending == BUDDY_BUILD_SOUND_SUCCESS;
+            const bool force = state.build_sound_force;
+
+            state.build_sound_pending = BUDDY_BUILD_SOUND_NONE;
+            state.build_sound_force = false;
+            ESP_LOGI(TAG, "build %s sound (%s, id %" PRIu64 ", sound %s)", ok ? "success" : "failure",
+                     force ? "preview" : "build result", state.build_sound_id,
+                     buddy_cues_enabled(&state) ? "on" : "off");
+            if (force || buddy_cues_enabled(&state)) {
+                if (ok) {
+                    buddy_sound_play_build_success();
+                } else {
+                    buddy_sound_play_build_failure();
+                }
+            }
         }
         if (now_ms - last_battery_ms >= BUDDY_BATTERY_SAMPLE_MS) {
             buddy_sample_battery(&state);
@@ -1055,6 +1126,8 @@ void app_main(void)
         ESP_LOGE(TAG, "settings initialization failed");
         return;
     }
+    buddy_sound_set_volume(s_initial_settings.volume);
+    ESP_LOGI(TAG, "volume restored: %u", (unsigned)s_initial_settings.volume);
     if (s_initial_settings.name[0] == '\0') {
         buddy_default_name(s_initial_settings.name);
         if (buddy_settings_set_name(s_initial_settings.name) != ESP_OK ||

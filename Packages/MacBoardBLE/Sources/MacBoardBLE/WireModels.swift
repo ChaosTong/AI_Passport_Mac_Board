@@ -10,9 +10,15 @@ public struct HeartbeatSnapshot: Codable, Equatable, Sendable {
     public var tokens: Int?
     public var tokensToday: Int?
     public var completed: Bool?
+    /// 最近一次编译结果（"success" / "failure"），任何页面都带，板子据此播放提示音。
+    public var buildResult: String?
+    /// 最近一次编译结束时间（epoch ms），同一次编译不变；板子按它变化边沿触发音效。
+    public var buildId: Int?
 
     enum CodingKeys: String, CodingKey {
         case page, total, running, waiting, msg, entries, tokens, completed
+        case buildResult = "bres"
+        case buildId = "bid"
         case tokensToday = "tokens_today"
     }
 

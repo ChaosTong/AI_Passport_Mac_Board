@@ -27,6 +27,17 @@ public enum BirkinBuildStatus: String, Sendable, Equatable {
     }
 }
 
+/// Birkin 推送 / 补齐的一条构建文案（Hammerspoon 菜单栏标题或 alert 显示过的原文，已清洗）。
+public struct BirkinProgressLine: Sendable, Equatable {
+    public let seq: Int
+    /// busy / success / failure / idle / info / hidden
+    public let state: String
+    public let text: String
+}
+
+/// Birkin 分布式通知名（与 Birkin tools/hammerspoon/init.lua 的 MACBOARD_NOTE 一致）。
+public let birkinProgressNotification = Notification.Name("com.chaos.macboard.birkin")
+
 public struct HammerspoonBuildService: Sendable {
     public var hsExecutable: String
 
@@ -56,6 +67,62 @@ public struct HammerspoonBuildService: Sendable {
             .split(whereSeparator: \.isNewline)
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    /// 一次性补齐：Birkin 记录的 seq 之后的文案（仅连接时调用，不轮询）。
+    /// Birkin 没有导出 `birkinProgressLines` 时返回 nil。
+    public func progressLines(since seq: Int) async -> (latestSeq: Int, lines: [BirkinProgressLine])? {
+        let raw = await runLuaExpression(
+            "(type(birkinProgressLines) == 'function' and birkinProgressLines(\(max(0, seq)))) or ''"
+        )
+        let rows = raw.split(whereSeparator: \.isNewline).map(String.init)
+        guard let head = rows.first, head.hasPrefix("#"), let latest = Int(head.dropFirst()) else {
+            return nil
+        }
+        var lines: [BirkinProgressLine] = []
+        for row in rows.dropFirst() {
+            let cols = row.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            guard cols.count == 3, let seq = Int(cols[0]),
+                  let text = Self.cleanProgress(String(cols[2])) else { continue }
+            lines.append(BirkinProgressLine(seq: seq, state: String(cols[1]), text: text))
+        }
+        return (latest, lines)
+    }
+
+    /// 解析 Birkin 分布式通知的 userInfo（seq / state / text 都是字符串）。
+    public static func progressLine(fromUserInfo info: [AnyHashable: Any]?) -> BirkinProgressLine? {
+        guard let info, let state = info["state"] as? String else { return nil }
+        let seq = Int((info["seq"] as? String) ?? "") ?? 0
+        let text = cleanProgress((info["text"] as? String) ?? "") ?? ""
+        return BirkinProgressLine(seq: seq, state: state, text: text)
+    }
+
+    static func cleanProgress(_ text: String) -> String? {
+        // Birkin 的状态 emoji 换成板子字体有的 ASCII，其余 emoji 去掉（板子字体没有这些字形）
+        let mapped = text
+            .replacingOccurrences(of: "✅", with: "OK ")
+            .replacingOccurrences(of: "❌", with: "FAIL ")
+            .replacingOccurrences(of: "⚠️", with: "! ")
+            .replacingOccurrences(of: "⚠", with: "! ")
+        let scalars = mapped.unicodeScalars.filter { scalar in
+            let v = scalar.value
+            if v == 0xFE0F || v == 0x200D { return false }
+            if (0x2600...0x27BF).contains(v) || v >= 0x1F000 { return false }
+            return !scalar.properties.isEmojiPresentation
+        }
+        var line = String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: .whitespacesAndNewlines)
+        if line == "nil" || line.isEmpty { return nil }
+        // 板子字体只有 ASCII + 常用汉字：把 Xcode 的分隔符换成 ASCII。
+        line = line
+            .replacingOccurrences(of: "•", with: "-")
+            .replacingOccurrences(of: "│", with: "|")
+            .replacingOccurrences(of: "·", with: "-")
+            .replacingOccurrences(of: "…", with: "...")
+            .replacingOccurrences(of: "，", with: ", ")
+        if line.hasPrefix("Building - ") {
+            line = String(line.dropFirst("Building - ".count))
+        }
+        return line.isEmpty ? nil : line
     }
 
     private func runLuaExpression(_ expr: String) async -> String {

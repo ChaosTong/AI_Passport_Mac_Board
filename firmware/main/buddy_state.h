@@ -65,7 +65,19 @@ typedef struct {
     uint16_t music_playlist_pick;
     uint16_t music_playlist_window;
     bool music_playlist_pick_armed;
-    char last_build_msg[BUDDY_COMMAND_MAX];
+    /* 编译结果音效（边沿触发）：build_sound_id 为已处理的编译 id；
+     * armed=false 时（开机 / 重连后第一个 heartbeat）只记录基线不出声。
+     * build_sound_pending 由 main 消费：0 无 / 1 成功 / 2 失败。 */
+    uint64_t build_sound_id;
+    bool build_sound_armed;
+    uint8_t build_sound_pending;
+    /* true = Mac 试听命令触发，忽略 SOUND 开关 */
+    bool build_sound_force;
+    /* 音量页：高亮档位；OK 确认后由 main 应用 / 持久化 / 试听 */
+    uint8_t volume_pick;
+    bool volume_commit_pending;
+    /* Mac 推来别的页的数据时，板子上报自己当前页（限频，下次允许上报的时间） */
+    uint64_t page_report_after_ms;
 } buddy_state_t;
 
 void buddy_state_init(buddy_state_t *state, const buddy_settings_snapshot_t *settings);

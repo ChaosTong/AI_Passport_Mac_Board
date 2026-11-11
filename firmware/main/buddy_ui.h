@@ -10,4 +10,3 @@ void buddy_ui_render(const buddy_ui_snapshot_t *snapshot);
 void buddy_ui_show_passkey(uint32_t passkey);
 void buddy_ui_tick(uint64_t elapsed_ms);
 void buddy_ui_scroll(int delta);
-int buddy_ui_log_scroll(void);

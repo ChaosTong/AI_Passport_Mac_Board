@@ -4,3 +4,5 @@ xcuserdata/
 DerivedData/
 .build/
 .swiftpm/
+firmware/build/
+.release/

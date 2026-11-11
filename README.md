@@ -70,7 +70,8 @@ flowchart LR
 | 页面 | 展示（heartbeat） | 操作 |
 |------|-------------------|------|
 | **Music** | `page:music`；`msg` 曲名；`entries` 艺人等；`running` 播放中 | OK 播放/暂停；UP/DOWN 上一曲/下一曲（键位实现时可微调） |
-| **Build** | `page:build`；`msg` 状态；`entries` 错误行；`running` = busy | OK 开始编译 |
+| **Build** | `page:build`；`msg` 状态；`entries` 过程时间线（失败时为错误行）；`running` = 编译中；`waiting` = 耗时 ms | OK（EVA PLAY 按钮）开始编译；编译中 PLAY 置灰、OK 不重复触发 |
+| **Volume**（第三页，`page:"volume"`） | 与音乐 / 编译平级的独立页面（不是叠加层，激活时另外两页被销毁、不刷新）。板子上 **长按 DOWN** 循环 音乐 → 编译 → 音量 → 音乐，并上行 `{"cmd":"page","action":"music\|build\|volume"}`，Mac 跟随。**板子是当前页的唯一来源**：Mac 没有切页入口，从 Xcode 开始编译也不切页；当前页记在 NVS `mbpage`（只在变化时写），重启 / 重连回到这一页（默认音乐）。板子上**没有旧 buddy 菜单 / SETTINGS / INFO**（长按 OK 无动作） | UP / DOWN 在 100 / 50 / 0 三档间移动，OK 保存（只在值变化时写 NVS `volume`，开机恢复）并停留本页，用新音量播一声提示。0 = 全部静音；MacBoard 模式下 SOUND 开关已无入口，提示音只由音量控制；Mac 的 ack 不再追加提示音（一次按键只有一声 click） |
 | **Settings** | 本地：亮度、BLE、取消配对 | 沿用 ai-passport 设置项子集 |
 
 **切换**：UP/DOWN 在 Music ↔ Build 循环；长按或 BACK 进 Settings（实现时对照键矩阵文档）。
@@ -100,22 +101,31 @@ flowchart LR
 {
   "page": "build",
   "msg": "busy",
-  "entries": ["error: ...", "error: ..."],
+  "entries": ["00:00 PLAY: birkinBuild()", "00:02 busy", "00:05 Planning 7533 / 7610"],
   "running": 1,
-  "waiting": 0,
-  "total": 2
+  "waiting": 5230,
+  "total": 3
 }
 ```
 
-固件 **只实现** `page` 为 `music` | `build` 的语义；不再解析 Danmaku 在线人数等含义。
+Build heartbeat 字段：`waiting` = 本次编译已耗时（毫秒，结束后冻结为总耗时；当前固件编译页不显示）；
+`entries` = 过程时间线 `mm:ss 文案`（最新在末尾，最多 8 条；步骤文案来自 Birkin `birkinProgress()`（可选）或 `birkinDiag()` 的 AX/DerivedData 文案）；
+`msg=failure` 且有错误时 `entries` 改为 `birkinErrors()` 错误行。固件编译页上半部整块显示这些行（最新在最下面），底部居中 PLAY 按钮。
+
+所有页面的 heartbeat 都可带 `bres`（最近一次编译结果 `success`/`failure`）和 `bid`（该次编译结束时间 epoch ms）。板子在 `bid` 变化时播放一次成功 / 失败音效（`firmware/main/sounds/` 内嵌的 16 kHz IMA-ADPCM 片段，由 `convert_sounds.py` 从源音频生成，独立声音任务异步播放），音量 0 时静音；开机 / 重连后第一个 heartbeat 只记基线不出声。
+
+heartbeat 的 `page`（`music` / `playlist` / `build` / `volume`）只表示“这份数据属于哪一页”，**固件从不据此切页**：与板子当前页不符的 heartbeat 只取 `bres`/`bid`（编译提示音在任何页都响），其余内容丢弃，并上行 `{"cmd":"page","action":"<当前页>"}`（每 2 s 最多一次），Mac 收到后跟随并推这一页的数据。`playlist` 只在音乐页打开播放列表。不再解析 Danmaku 在线人数等含义。
 
 **其它下行**
 
 - `{"cmd":"name","name":"..."}` / `{"cmd":"owner","name":"MacBoard"}`
 - `{"cmd":"status"}` → 板子回 `ack`
 - `{"cmd":"unpair"}`（设置里用）
+- `{"cmd":"sound","name":"build_success|build_failure"}` → 板子播放对应编译音效（试听用，**不受板子 SOUND 开关影响**），回 `{"ack":"sound","ok":true}`；未知 name 回 `ok:false,"error":"unknown sound"`。菜单栏「试听成功音效 / 试听失败音效」按钮发送此命令（未就绪时置灰）。
 
 推送：状态变更立即发送；连接后 **10s keepalive**。
+
+自动重连：App 启动时、链路断开（板子复位 / 重刷 / 掉线）或连接失败后，按记住的上一块板子 UUID 直连并扫描兜底，退避 2s → 4s → 8s → 16s → 30s（之后每 30s）重试，链路加密就绪后清零；在菜单点「断开」后不再自动重连（点「扫描」恢复）。
 
 ### 3.2 硬件 → Mac
 
@@ -278,9 +288,11 @@ ai_passport_mac_board/
 ### 5.1 来源与裁剪
 
 1. 以官方 [FoloToy/ai-passport](https://gitee.com/FoloToy/ai-passport)（或本地 `ChaosApp/AI_Board/ai-passport`）为基底拷贝到 `ai_passport_mac_board/firmware/`
-2. 删除或 `#if 0`：弹幕 UI、`BUDDY_PAGE_TRANSCRIPT`、PET/INFO 演示页、权限审批流（若无 AI 助手需求）
-3. 保留：BLE/NUS、`buddy_protocol` 核心、配对、设置、电量
-4. 新增：`draw_macboard_music` / `draw_macboard_build`，`buddy_protocol` 登记 `media` / `build`
+2. 已删除：旧 buddy 画布 UI（I4 整屏画布 38KB RAM、HOME/PET/INFO/消息/SETTINGS/菜单 画面）、`buddy_character`（ASCII 角色帧）、`buddy_i4`、`buddy_text_layout` 及其 host 测试、`tools/windows_buddy_controller`
+3. 保留：BLE/NUS、`buddy_protocol` 核心、配对、电量、NVS 设置（volume 等）；`buddy_state` 里旧状态机仍在（不可达），留给协议/BLE 测试
+4. UI：`buddy_ui.c` 只调度三张 EVA 页（`buddy_eva_music` / `buddy_eva_build` / `buddy_eva_volume`，按需创建、隐藏即销毁）；基础屏只显示系统提示（BLE 配对码、Mac 发起的 unpair 确认、权限请求）
+5. sdkconfig 瘦身（见 `sdkconfig.defaults` 末尾）：LVGL 只开 obj/label/image/canvas；绘制格式只留 RGB565(+swapped)/A8/ARGB8888；内置字体只留 UNSCII_8（所有文字用 `main/fonts/font_zh_16.c`，约 3700 常用汉字，歌名需要，未裁剪）；不编 LVGL 示例/Demo；`-Os`。日志级别仍为 INFO
+6. 体积：应用镜像 0x156780 → 0x115820（−266 KB，分区剩余 9% → 26%）；静态 RAM 240,064 → 190,774 B（+49 KB）；音乐页 LVGL 堆空闲 7,328 → 9,920 B
 
 ### 5.2 烧录
 

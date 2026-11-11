@@ -90,18 +90,12 @@ struct MenuContentView: View {
 
     private var pageSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("推送页面")
+            Text("板子页面")
                 .font(.subheadline.bold())
-            Picker("页面", selection: Binding(
-                get: { bridge.activePage },
-                set: { bridge.setActivePage($0) }
-            )) {
-                ForEach(MacBoardPage.allCases) { page in
-                    Text(page.displayName).tag(page)
-                }
-            }
-            .pickerStyle(.segmented)
-            .disabled(bridge.phase != .ready)
+            // 页面只由板子决定（长按 DOWN 切换），Mac 只跟随、推送该页数据
+            Text("当前：\(bridge.activePage.displayName)（在板子上长按 DOWN 切换）")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -132,6 +126,20 @@ struct MenuContentView: View {
             Text("状态：\(bridge.buildStatus.rawValue)")
                 .font(.caption.monospaced())
             Button("触发 birkinBuild()") { bridge.triggerTestBuild() }
+            HStack {
+                Button("试听成功音效") { bridge.previewBuildSound(success: true) }
+                Button("试听失败音效") { bridge.previewBuildSound(success: false) }
+            }
+            .disabled(bridge.phase != .ready)
+            if !bridge.buildProcessLines.isEmpty {
+                Text("编译过程")
+                    .font(.caption.bold())
+                ForEach(Array(bridge.buildProcessLines.suffix(4).enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.caption2.monospaced())
+                        .lineLimit(1)
+                }
+            }
             if !bridge.buildErrorLines.isEmpty {
                 Text("错误摘要")
                     .font(.caption.bold())

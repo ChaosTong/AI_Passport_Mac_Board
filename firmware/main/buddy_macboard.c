@@ -8,22 +8,56 @@ bool buddy_macboard_owner_is_companion(const char *owner)
     return owner != NULL && strcmp(owner, "MacBoard") == 0;
 }
 
-void buddy_macboard_apply_page_wire(buddy_state_t *state, const char *page_wire)
+/* 板子是当前页的唯一来源：Mac heartbeat 的 page 只用来判断这份数据是不是给当前页的，
+ * 从不切页。返回 true = 数据属于当前页（可以显示）。 */
+bool buddy_macboard_heartbeat_for_page(buddy_state_t *state, const char *page_wire)
 {
     if (state == NULL || page_wire == NULL) {
+        return false;
+    }
+    if (state->page == BUDDY_PAGE_MUSIC) {
+        if (strcmp(page_wire, "playlist") == 0) {
+            state->music_playlist_open = true;
+            return true;
+        }
+        if (strcmp(page_wire, "music") == 0) {
+            if (!state->music_playlist_open) {
+                state->music_playlist_pick_armed = false;
+            }
+            return true;
+        }
+        return false;
+    }
+    if (state->page == BUDDY_PAGE_BUILD) {
+        return strcmp(page_wire, "build") == 0;
+    }
+    if (state->page == BUDDY_PAGE_VOLUME) {
+        return strcmp(page_wire, "volume") == 0;
+    }
+    return false;
+}
+
+buddy_page_t buddy_macboard_page_from_setting(uint8_t value)
+{
+    if (value == BUDDY_MACBOARD_PAGE_BUILD) return BUDDY_PAGE_BUILD;
+    if (value == BUDDY_MACBOARD_PAGE_VOLUME) return BUDDY_PAGE_VOLUME;
+    return BUDDY_PAGE_MUSIC;
+}
+
+uint8_t buddy_macboard_page_to_setting(buddy_page_t page)
+{
+    if (page == BUDDY_PAGE_BUILD) return BUDDY_MACBOARD_PAGE_BUILD;
+    if (page == BUDDY_PAGE_VOLUME) return BUDDY_MACBOARD_PAGE_VOLUME;
+    return BUDDY_MACBOARD_PAGE_MUSIC;
+}
+
+void buddy_macboard_restore_page(buddy_state_t *state)
+{
+    if (state == NULL) {
         return;
     }
-    if (strcmp(page_wire, "music") == 0) {
-        state->page = BUDDY_PAGE_MUSIC;
-        if (!state->music_playlist_open) {
-            state->music_playlist_pick_armed = false;
-        }
-    } else if (strcmp(page_wire, "build") == 0) {
-        state->page = BUDDY_PAGE_BUILD;
-    } else if (strcmp(page_wire, "playlist") == 0) {
-        state->page = BUDDY_PAGE_MUSIC;
-        state->music_playlist_open = true;
-    }
+    state->page = buddy_macboard_page_from_setting(state->settings.macboard_page);
+    state->volume_pick = buddy_volume_snap(state->settings.volume);
 }
 
 static void buddy_macboard_queue_uplink(buddy_action_t *action, const char *cmd,
@@ -189,10 +223,6 @@ bool buddy_macboard_handle_key(buddy_state_t *state, buddy_key_t key, buddy_acti
     if (state == NULL || !state->macboard_companion) {
         return false;
     }
-    if (state->menu_open || state->page == BUDDY_PAGE_SETTINGS) {
-        return false;
-    }
-
     if (state->page == BUDDY_PAGE_MUSIC) {
         if (state->music_playlist_open) {
             return buddy_macboard_playlist_key(state, key, action);
@@ -214,8 +244,30 @@ bool buddy_macboard_handle_key(buddy_state_t *state, buddy_key_t key, buddy_acti
         }
         return false;
     }
+    if (state->page == BUDDY_PAGE_VOLUME) {
+        if (key == BUDDY_KEY_UP) {
+            state->volume_pick = state->volume_pick >= 100U ? 0U : (uint8_t)(state->volume_pick + 50U);
+            return true;
+        }
+        if (key == BUDDY_KEY_DOWN) {
+            state->volume_pick = state->volume_pick == 0U ? 100U : (uint8_t)(state->volume_pick - 50U);
+            return true;
+        }
+        if (key == BUDDY_KEY_OK) {
+            /* 确认：main 负责应用 codec、值变化才写 NVS、按新音量试听；停留在音量页 */
+            state->settings.volume = state->volume_pick;
+            state->volume_commit_pending = true;
+            return true;
+        }
+        return false;
+    }
     if (state->page == BUDDY_PAGE_BUILD) {
         if (key == BUDDY_KEY_OK) {
+            /* OK = EVA PLAY 按钮。编译进行中（且 Mac 心跳未过期）不重复触发 ⌘B。 */
+            if (state->running != 0U && !state->heartbeat_stale &&
+                buddy_macboard_build_phase(state->message) == BUDDY_BUILD_PHASE_ACTIVE) {
+                return true;
+            }
             buddy_macboard_queue_uplink(action, "build", "start");
             return true;
         }
@@ -231,4 +283,95 @@ bool buddy_macboard_handle_key(buddy_state_t *state, buddy_key_t key, buddy_acti
         return true;
     }
     return false;
+}
+
+buddy_build_phase_t buddy_macboard_build_phase(const char *status)
+{
+    if (status == NULL || status[0] == '\0') {
+        return BUDDY_BUILD_PHASE_IDLE;
+    }
+    if (strcmp(status, "busy") == 0 || strcmp(status, "starting") == 0) {
+        return BUDDY_BUILD_PHASE_ACTIVE;
+    }
+    if (strcmp(status, "success") == 0) {
+        return BUDDY_BUILD_PHASE_SUCCESS;
+    }
+    if (strcmp(status, "failure") == 0 || strcmp(status, "no-xcode") == 0) {
+        return BUDDY_BUILD_PHASE_FAILURE;
+    }
+    return BUDDY_BUILD_PHASE_IDLE;
+}
+
+void buddy_macboard_track_build_result(buddy_state_t *state, const buddy_heartbeat_t *heartbeat)
+{
+    uint8_t sound = BUDDY_BUILD_SOUND_NONE;
+
+    if (state == NULL || heartbeat == NULL) {
+        return;
+    }
+    if (strcmp(heartbeat->build_result, "success") == 0) {
+        sound = BUDDY_BUILD_SOUND_SUCCESS;
+    } else if (strcmp(heartbeat->build_result, "failure") == 0) {
+        sound = BUDDY_BUILD_SOUND_FAILURE;
+    }
+    if (sound == BUDDY_BUILD_SOUND_NONE || heartbeat->build_id == 0U) {
+        /* 没有已结束的编译（Mac 刚启动 / 编译中）：之后出现的第一个结果就是新结果 */
+        state->build_sound_armed = true;
+        return;
+    }
+    if (state->build_sound_armed && heartbeat->build_id != state->build_sound_id) {
+        state->build_sound_pending = sound;
+    }
+    state->build_sound_id = heartbeat->build_id;
+    state->build_sound_armed = true;
+}
+
+void buddy_macboard_report_page(buddy_state_t *state, uint64_t now_ms, buddy_action_t *action)
+{
+    if (state == NULL || now_ms < state->page_report_after_ms) {
+        return;
+    }
+    state->page_report_after_ms = now_ms + BUDDY_MACBOARD_PAGE_REPORT_MS;
+    buddy_macboard_queue_uplink(action, "page", buddy_macboard_page_wire(state->page));
+}
+
+const char *buddy_macboard_page_wire(buddy_page_t page)
+{
+    switch (page) {
+    case BUDDY_PAGE_BUILD:
+        return "build";
+    case BUDDY_PAGE_VOLUME:
+        return "volume";
+    default:
+        return "music";
+    }
+}
+
+bool buddy_macboard_handle_long_key(buddy_state_t *state, buddy_key_t key, uint64_t now_ms,
+                                    buddy_action_t *action)
+{
+    buddy_page_t next;
+
+    if (state == NULL || !state->macboard_companion || state->menu_open ||
+        key != BUDDY_KEY_DOWN) {
+        return false;
+    }
+    /* 长按 DOWN：音乐 → 编译 → 音量 → 音乐 循环（播放列表打开时不切） */
+    if (state->page == BUDDY_PAGE_MUSIC && !state->music_playlist_open) {
+        next = BUDDY_PAGE_BUILD;
+    } else if (state->page == BUDDY_PAGE_BUILD) {
+        next = BUDDY_PAGE_VOLUME;
+    } else if (state->page == BUDDY_PAGE_VOLUME) {
+        next = BUDDY_PAGE_MUSIC;
+    } else {
+        return false;
+    }
+    if (next == BUDDY_PAGE_VOLUME) {
+        state->volume_pick = buddy_volume_snap(state->settings.volume);
+    }
+    state->page = next;
+    /* 告诉 Mac 板子选了哪页（Mac 跟随，之后推送的就是这一页的数据）；main 负责写 NVS */
+    state->page_report_after_ms = now_ms + BUDDY_MACBOARD_PAGE_REPORT_MS;
+    buddy_macboard_queue_uplink(action, "page", buddy_macboard_page_wire(next));
+    return true;
 }

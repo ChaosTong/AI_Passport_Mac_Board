@@ -8,6 +8,10 @@ typedef struct {
     char name[BUDDY_NAME_MAX];
     char owner[BUDDY_OWNER_MAX];
     uint8_t ble;
+    uint8_t volume;
+    bool has_volume;
+    uint8_t mbpage;
+    bool has_mbpage;
     uint64_t approvals;
     uint64_t denials;
     uint64_t level;
@@ -80,6 +84,20 @@ static esp_err_t fake_get_u8(void *context, const char *key, uint8_t *value)
         return storage->get_u8_error;
     }
 
+    if (strcmp(key, "volume") == 0) {
+        if (!storage->has_volume) {
+            return ESP_ERR_NVS_NOT_FOUND;
+        }
+        *value = storage->volume;
+        return ESP_OK;
+    }
+    if (strcmp(key, "mbpage") == 0) {
+        if (!storage->has_mbpage) {
+            return ESP_ERR_NVS_NOT_FOUND;
+        }
+        *value = storage->mbpage;
+        return ESP_OK;
+    }
     if (strcmp(key, "ble") != 0 || !storage->has_ble) {
         return ESP_ERR_NVS_NOT_FOUND;
     }
@@ -91,6 +109,16 @@ static esp_err_t fake_set_u8(void *context, const char *key, uint8_t value)
 {
     fake_storage_t *storage = context;
 
+    if (strcmp(key, "volume") == 0) {
+        storage->volume = value;
+        storage->has_volume = true;
+        return ESP_OK;
+    }
+    if (strcmp(key, "mbpage") == 0) {
+        storage->mbpage = value;
+        storage->has_mbpage = true;
+        return ESP_OK;
+    }
     if (strcmp(key, "ble") != 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -384,8 +412,80 @@ static void test_factory_reset_only_erases_buddy_backend(void)
     assert(snapshot.ble_enabled);
 }
 
+static void test_macboard_page_persists_only_on_change(void)
+{
+    fake_storage_t storage;
+    buddy_settings_snapshot_t snapshot;
+
+    test_setup(&storage);
+    assert(buddy_settings_load(&snapshot) == ESP_OK);
+    assert(snapshot.macboard_page == BUDDY_MACBOARD_PAGE_MUSIC);
+
+    /* 值不变不写 */
+    assert(buddy_settings_set_macboard_page(BUDDY_MACBOARD_PAGE_MUSIC) == ESP_OK);
+    assert(buddy_settings_flush(true) == ESP_OK);
+    assert(storage.commit_count == 0 && !storage.has_mbpage);
+    assert(buddy_settings_set_macboard_page(3) == ESP_ERR_INVALID_ARG);
+    assert(buddy_settings_set_macboard_page(BUDDY_MACBOARD_PAGE_VOLUME) == ESP_OK);
+    assert(buddy_settings_flush(true) == ESP_OK);
+    assert(storage.commit_count == 1 && storage.mbpage == BUDDY_MACBOARD_PAGE_VOLUME);
+
+    /* 重启后恢复；存储里的非法值回落音乐页 */
+    buddy_settings_test_set_backend(&fake_backend, &storage);
+    assert(buddy_settings_init() == ESP_OK);
+    assert(buddy_settings_load(&snapshot) == ESP_OK);
+    assert(snapshot.macboard_page == BUDDY_MACBOARD_PAGE_VOLUME);
+    storage.mbpage = 9;
+    buddy_settings_test_set_backend(&fake_backend, &storage);
+    assert(buddy_settings_init() == ESP_OK);
+    assert(buddy_settings_load(&snapshot) == ESP_OK);
+    assert(snapshot.macboard_page == BUDDY_MACBOARD_PAGE_MUSIC);
+}
+
+static void test_volume_defaults_persists_and_rejects_out_of_range(void)
+{
+    fake_storage_t storage;
+    buddy_settings_snapshot_t snapshot;
+
+    test_setup(&storage);
+    assert(buddy_settings_load(&snapshot) == ESP_OK);
+    assert(snapshot.volume == BUDDY_DEFAULT_VOLUME);
+
+    /* 拖滑杆：多次设置只改内存，不提交 */
+    /* 默认 50 再设 50（吸附后 60→50）：不变，不标脏 */
+    assert(buddy_settings_set_volume(60) == ESP_OK);
+    assert(buddy_settings_flush(true) == ESP_OK);
+    assert(storage.commit_count == 0);
+    assert(buddy_settings_set_volume(101) == ESP_ERR_INVALID_ARG);
+    assert(buddy_settings_set_volume(90) == ESP_OK); /* → 100 */
+    assert(buddy_settings_flush(true) == ESP_OK);
+    assert(storage.commit_count == 1);
+    assert(storage.has_volume && storage.volume == 100);
+
+    /* 重启后恢复 */
+    buddy_settings_test_set_backend(&fake_backend, &storage);
+    assert(buddy_settings_init() == ESP_OK);
+    assert(buddy_settings_load(&snapshot) == ESP_OK);
+    assert(snapshot.volume == 100);
+
+    /* 存储里的非档位值吸附，越界值回落默认 */
+    storage.volume = 20;
+    buddy_settings_test_set_backend(&fake_backend, &storage);
+    assert(buddy_settings_init() == ESP_OK);
+    assert(buddy_settings_load(&snapshot) == ESP_OK);
+    assert(snapshot.volume == 0);
+
+    storage.volume = 200;
+    buddy_settings_test_set_backend(&fake_backend, &storage);
+    assert(buddy_settings_init() == ESP_OK);
+    assert(buddy_settings_load(&snapshot) == ESP_OK);
+    assert(snapshot.volume == BUDDY_DEFAULT_VOLUME);
+}
+
 int main(void)
 {
+    test_macboard_page_persists_only_on_change();
+    test_volume_defaults_persists_and_rejects_out_of_range();
     test_rapid_permissions_only_commit_on_forced_flush();
     test_regular_flush_is_limited_to_once_per_minute();
     test_name_validation_and_defaults();

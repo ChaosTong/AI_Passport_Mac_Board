@@ -8,19 +8,19 @@ idf_component_register(
          "buddy_protocol.c"
          "buddy_state.c"
          "buddy_settings.c"
-         "buddy_character.c"
         "buddy_ui.c"
         "buddy_sound.c"
+        "sounds/build_sounds.c"
         "buddy_macboard.c"
         "buddy_eva_music.c"
-        "buddy_i4.c"
-        "buddy_text_layout.c"
+        "buddy_eva_build.c"
+        "buddy_eva_volume.c"
         "fonts/font_zh_16.c"
         "eva/eva_clock.c"
         "eva/eva_player_frame.c"
         "eva/eva_text_assets.c"
         "eva/eva_text_buttons.c"
-    INCLUDE_DIRS "." "eva"
+    INCLUDE_DIRS "." "eva" "sounds"
     REQUIRES bsp bt esp_hw_support esp_timer json nvs_flash
 )
 

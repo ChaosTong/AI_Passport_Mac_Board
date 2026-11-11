@@ -18,6 +18,8 @@
 #define BUDDY_SETTINGS_DIRTY_DENY (1U << 4)
 #define BUDDY_SETTINGS_DIRTY_LEVEL (1U << 5)
 #define BUDDY_SETTINGS_DIRTY_SOUND (1U << 6)
+#define BUDDY_SETTINGS_DIRTY_VOLUME (1U << 7)
+#define BUDDY_SETTINGS_DIRTY_PAGE (1U << 8)
 
 typedef struct {
     esp_err_t (*get_str)(void *context, const char *key, char *value, size_t *length);
@@ -112,6 +114,7 @@ static void buddy_settings_snapshot_defaults(buddy_settings_snapshot_t *settings
     memset(settings, 0, sizeof(*settings));
     settings->ble_enabled = true;
     settings->sound_enabled = true;
+    settings->volume = BUDDY_DEFAULT_VOLUME;
 }
 
 static void buddy_settings_defaults(void)
@@ -227,6 +230,14 @@ static esp_err_t buddy_settings_stage(const buddy_settings_snapshot_t *settings,
     }
     if ((dirty & BUDDY_SETTINGS_DIRTY_SOUND) != 0U) {
         err = s_backend->set_u8(s_backend_context, "sound", settings->sound_enabled ? 1U : 0U);
+        if (err != ESP_OK) return err;
+    }
+    if ((dirty & BUDDY_SETTINGS_DIRTY_VOLUME) != 0U) {
+        err = s_backend->set_u8(s_backend_context, "volume", settings->volume);
+        if (err != ESP_OK) return err;
+    }
+    if ((dirty & BUDDY_SETTINGS_DIRTY_PAGE) != 0U) {
+        err = s_backend->set_u8(s_backend_context, "mbpage", settings->macboard_page);
         if (err != ESP_OK) return err;
     }
     if ((dirty & BUDDY_SETTINGS_DIRTY_APPROVE) != 0U) {
@@ -370,6 +381,18 @@ esp_err_t buddy_settings_load(buddy_settings_snapshot_t *snapshot)
         } else if (err != ESP_ERR_NVS_NOT_FOUND) {
             return err;
         }
+        err = s_backend->get_u8(s_backend_context, "volume", &ble);
+        if (err == ESP_OK) {
+            loaded.volume = ble <= 100U ? buddy_volume_snap(ble) : BUDDY_DEFAULT_VOLUME;
+        } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+            return err;
+        }
+        err = s_backend->get_u8(s_backend_context, "mbpage", &ble);
+        if (err == ESP_OK) {
+            loaded.macboard_page = ble <= BUDDY_MACBOARD_PAGE_VOLUME ? ble : BUDDY_MACBOARD_PAGE_MUSIC;
+        } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+            return err;
+        }
         err = s_backend->get_u64(s_backend_context, "approve", &value);
         if (err == ESP_OK) {
             loaded.approval_count = value;
@@ -458,6 +481,37 @@ esp_err_t buddy_settings_set_sound_enabled(bool enabled)
     }
     s_settings.sound_enabled = enabled;
     s_dirty |= BUDDY_SETTINGS_DIRTY_SOUND;
+    return ESP_OK;
+}
+
+esp_err_t buddy_settings_set_volume(uint8_t volume)
+{
+    if (!s_initialized || volume > 100U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (buddy_settings_ensure_loaded() != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    volume = buddy_volume_snap(volume);
+    if (s_settings.volume != volume) {
+        s_settings.volume = volume;
+        s_dirty |= BUDDY_SETTINGS_DIRTY_VOLUME; /* 只标脏：调用方 flush（值不变则不写） */
+    }
+    return ESP_OK;
+}
+
+esp_err_t buddy_settings_set_macboard_page(uint8_t page)
+{
+    if (!s_initialized || page > BUDDY_MACBOARD_PAGE_VOLUME) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (buddy_settings_ensure_loaded() != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_settings.macboard_page != page) {
+        s_settings.macboard_page = page;
+        s_dirty |= BUDDY_SETTINGS_DIRTY_PAGE; /* 只标脏：调用方 flush（值不变则不写） */
+    }
     return ESP_OK;
 }
 

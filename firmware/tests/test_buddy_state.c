@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "buddy_macboard.h"
 #include "buddy_protocol.h"
 #include "buddy_state.h"
 
@@ -942,6 +943,290 @@ static void test_new_link_generation_invalidates_sensitive_state_when_disconnect
     assert(!state.confirmation_pending);
 }
 
+static void test_macboard_build_phase(void)
+{
+    assert(buddy_macboard_build_phase(NULL) == BUDDY_BUILD_PHASE_IDLE);
+    assert(buddy_macboard_build_phase("idle") == BUDDY_BUILD_PHASE_IDLE);
+    assert(buddy_macboard_build_phase("unknown") == BUDDY_BUILD_PHASE_IDLE);
+    assert(buddy_macboard_build_phase("starting") == BUDDY_BUILD_PHASE_ACTIVE);
+    assert(buddy_macboard_build_phase("busy") == BUDDY_BUILD_PHASE_ACTIVE);
+    assert(buddy_macboard_build_phase("success") == BUDDY_BUILD_PHASE_SUCCESS);
+    assert(buddy_macboard_build_phase("failure") == BUDDY_BUILD_PHASE_FAILURE);
+    assert(buddy_macboard_build_phase("no-xcode") == BUDDY_BUILD_PHASE_FAILURE);
+}
+
+static void test_macboard_build_ok_starts_once_while_running(void)
+{
+    buddy_state_t state;
+    buddy_action_t action;
+
+    buddy_state_init(&state, NULL);
+    state.macboard_companion = true;
+    state.page = BUDDY_PAGE_BUILD;
+
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_OK, &action));
+    assert(action.type == BUDDY_ACTION_MACBOARD_UPLINK);
+    assert(strcmp(action.macboard_cmd, "build") == 0);
+    assert(strcmp(action.macboard_action, "start") == 0);
+
+    /* Mac 报告编译中：PLAY 置灰，OK 被吞掉不再上行。 */
+    snprintf(state.message, sizeof(state.message), "busy");
+    state.running = 1U;
+    state.heartbeat_stale = false;
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_OK, &action));
+    assert(action.type == BUDDY_ACTION_NONE);
+
+    /* 心跳过期：允许重新触发，避免卡死在 busy。 */
+    state.heartbeat_stale = true;
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_OK, &action));
+    assert(action.type == BUDDY_ACTION_MACBOARD_UPLINK);
+
+    /* 编译结束：再次可按。 */
+    state.heartbeat_stale = false;
+    snprintf(state.message, sizeof(state.message), "failure");
+    state.running = 0U;
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_OK, &action));
+    assert(action.type == BUDDY_ACTION_MACBOARD_UPLINK);
+}
+
+static void build_result_heartbeat(buddy_state_t *state, const char *page, const char *bres,
+                                   uint64_t bid)
+{
+    buddy_event_t event;
+    buddy_action_t action;
+
+    memset(&event, 0, sizeof(event));
+    event.type = BUDDY_EVENT_HEARTBEAT;
+    event.heartbeat.connected = true;
+    snprintf(event.heartbeat.page, sizeof(event.heartbeat.page), "%s", page);
+    snprintf(event.heartbeat.build_result, sizeof(event.heartbeat.build_result), "%s", bres);
+    event.heartbeat.build_id = bid;
+    buddy_state_reduce(state, &event, 1000, &action);
+}
+
+static void test_macboard_build_sound_edge(void)
+{
+    buddy_state_t state;
+    buddy_event_t event;
+    buddy_action_t action;
+
+    buddy_state_init(&state, NULL);
+    state.macboard_companion = true;
+
+    /* 开机后第一个 heartbeat 带旧结果：只记基线，不出声。 */
+    build_result_heartbeat(&state, "music", "success", 100);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_NONE);
+    /* 重复 heartbeat / 换页：同一 bid 不再触发。 */
+    build_result_heartbeat(&state, "build", "success", 100);
+    build_result_heartbeat(&state, "music", "success", 100);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_NONE);
+
+    /* 编译中（无结果）→ 新的成功：触发一次，音乐页也触发。 */
+    build_result_heartbeat(&state, "build", "", 0);
+    build_result_heartbeat(&state, "music", "success", 200);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_SUCCESS);
+    state.build_sound_pending = BUDDY_BUILD_SOUND_NONE;
+    build_result_heartbeat(&state, "music", "success", 200);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_NONE);
+
+    /* 连续两次结果相同但 bid 不同（无改动的重复编译）：各触发一次。 */
+    build_result_heartbeat(&state, "build", "failure", 300);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_FAILURE);
+    state.build_sound_pending = BUDDY_BUILD_SOUND_NONE;
+    build_result_heartbeat(&state, "build", "failure", 300);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_NONE);
+
+    /* 重连：第一个结果（即使是断开期间的新结果）只当基线。 */
+    memset(&event, 0, sizeof(event));
+    event.type = BUDDY_EVENT_BLE_CONNECTED;
+    event.ble.connection_generation = 7;
+    buddy_state_reduce(&state, &event, 2000, &action);
+    build_result_heartbeat(&state, "build", "success", 400);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_NONE);
+    build_result_heartbeat(&state, "build", "failure", 500);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_FAILURE);
+    state.build_sound_pending = BUDDY_BUILD_SOUND_NONE;
+
+    /* 非 MacBoard 主机不处理。 */
+    state.macboard_companion = false;
+    build_result_heartbeat(&state, "build", "success", 600);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_NONE);
+}
+
+static void key_event(buddy_state_t *state, buddy_event_type_t type, buddy_key_t key)
+{
+    buddy_event_t event;
+    buddy_action_t action;
+
+    memset(&event, 0, sizeof(event));
+    event.type = type;
+    event.key = key;
+    buddy_state_reduce(state, &event, 1000, &action);
+}
+
+static void page_heartbeat_at(buddy_state_t *state, const char *page, uint64_t now_ms)
+{
+    buddy_event_t event;
+    buddy_action_t action;
+
+    memset(&event, 0, sizeof(event));
+    event.type = BUDDY_EVENT_HEARTBEAT;
+    event.heartbeat.connected = true;
+    snprintf(event.heartbeat.page, sizeof(event.heartbeat.page), "%s", page);
+    buddy_state_reduce(state, &event, now_ms, &action);
+}
+
+static void long_key_at(buddy_state_t *state, buddy_key_t key, uint64_t now_ms,
+                        buddy_action_t *action)
+{
+    buddy_event_t event;
+
+    memset(&event, 0, sizeof(event));
+    memset(action, 0, sizeof(*action));
+    event.type = BUDDY_EVENT_KEY_LONG;
+    event.key = key;
+    buddy_state_reduce(state, &event, now_ms, action);
+}
+
+static void test_macboard_volume_page(void)
+{
+    buddy_state_t state;
+    buddy_action_t action;
+    buddy_event_t event;
+    buddy_settings_snapshot_t settings;
+
+    /* 开机：MacBoard 回到 NVS 记住的页（这里记的是编译页） */
+    memset(&settings, 0, sizeof(settings));
+    snprintf(settings.owner, sizeof(settings.owner), "MacBoard");
+    settings.volume = 50;
+    settings.macboard_page = BUDDY_MACBOARD_PAGE_BUILD;
+    buddy_state_init(&state, &settings);
+    assert(state.macboard_companion && state.page == BUDDY_PAGE_BUILD);
+
+    /* 未知值回落音乐页 */
+    settings.macboard_page = 7;
+    buddy_state_init(&state, &settings);
+    assert(state.page == BUDDY_PAGE_MUSIC);
+
+    /* Mac 推别的页：不换页、不显示其数据，板子上报自己的页（限频 2s） */
+    memset(&action, 0, sizeof(action));
+    memset(&event, 0, sizeof(event));
+    event.type = BUDDY_EVENT_HEARTBEAT;
+    event.heartbeat.connected = true;
+    snprintf(event.heartbeat.page, sizeof(event.heartbeat.page), "build");
+    snprintf(event.heartbeat.message, sizeof(event.heartbeat.message), "busy");
+    buddy_state_reduce(&state, &event, 100, &action);
+    assert(state.page == BUDDY_PAGE_MUSIC);
+    assert(strcmp(state.message, "busy") != 0);
+    assert(action.type == BUDDY_ACTION_MACBOARD_UPLINK);
+    assert(strcmp(action.macboard_cmd, "page") == 0 && strcmp(action.macboard_action, "music") == 0);
+    buddy_state_reduce(&state, &event, 500, &action);
+    assert(action.type != BUDDY_ACTION_MACBOARD_UPLINK);
+    page_heartbeat_at(&state, "volume", 1000);
+    assert(state.page == BUDDY_PAGE_MUSIC);
+
+    /* 编译结果在别的页的 heartbeat 里也照样触发提示音（先记基线，bid 变化才响） */
+    build_result_heartbeat(&state, "build", "success", 1);
+    build_result_heartbeat(&state, "build", "success", 2);
+    assert(state.page == BUDDY_PAGE_MUSIC);
+    assert(state.build_sound_pending == BUDDY_BUILD_SOUND_SUCCESS);
+    state.build_sound_pending = BUDDY_BUILD_SOUND_NONE;
+
+    /* 长按 DOWN：音乐 → 编译 → 音量 → 音乐，每次都上行告诉 Mac */
+    long_key_at(&state, BUDDY_KEY_DOWN, 3000, &action);
+    assert(state.page == BUDDY_PAGE_BUILD);
+    assert(action.type == BUDDY_ACTION_MACBOARD_UPLINK);
+    assert(strcmp(action.macboard_cmd, "page") == 0 && strcmp(action.macboard_action, "build") == 0);
+    /* Mac 跟上之后推 build：数据显示，页不变 */
+    memset(&event, 0, sizeof(event));
+    event.type = BUDDY_EVENT_HEARTBEAT;
+    event.heartbeat.connected = true;
+    snprintf(event.heartbeat.page, sizeof(event.heartbeat.page), "build");
+    snprintf(event.heartbeat.message, sizeof(event.heartbeat.message), "busy");
+    buddy_state_reduce(&state, &event, 3100, &action);
+    assert(state.page == BUDDY_PAGE_BUILD && strcmp(state.message, "busy") == 0);
+
+    long_key_at(&state, BUDDY_KEY_DOWN, 3200, &action);
+    assert(state.page == BUDDY_PAGE_VOLUME);
+    assert(strcmp(action.macboard_action, "volume") == 0);
+    assert(state.volume_pick == 50U);
+    /* Mac 还推 build / music：不会把板子从音量页拉走 */
+    page_heartbeat_at(&state, "build", 3300);
+    page_heartbeat_at(&state, "music", 9000);
+    assert(state.page == BUDDY_PAGE_VOLUME);
+
+    /* UP/DOWN 选档（循环），未保存前不改设置 */
+    key_event(&state, BUDDY_EVENT_KEY_CLICK, BUDDY_KEY_UP);
+    assert(state.volume_pick == 100U);
+    key_event(&state, BUDDY_EVENT_KEY_CLICK, BUDDY_KEY_UP);
+    assert(state.volume_pick == 0U);
+    key_event(&state, BUDDY_EVENT_KEY_CLICK, BUDDY_KEY_DOWN);
+    assert(state.volume_pick == 100U);
+    assert(!state.volume_commit_pending && state.settings.volume == 50U);
+
+    /* OK 保存并停留在音量页 */
+    key_event(&state, BUDDY_EVENT_KEY_CLICK, BUDDY_KEY_OK);
+    assert(state.page == BUDDY_PAGE_VOLUME);
+    assert(state.settings.volume == 100U && state.volume_commit_pending);
+    state.volume_commit_pending = false;
+
+    /* Mac 的 ack 不再追加提示音（只有按键本身一声 click） */
+    memset(&event, 0, sizeof(event));
+    memset(&action, 0, sizeof(action));
+    event.type = BUDDY_EVENT_HOST_ACK;
+    event.host_ack.ack_ok = true;
+    buddy_state_reduce(&state, &event, 9100, &action);
+    assert(action.type != BUDDY_ACTION_SOUND_CUE);
+
+    long_key_at(&state, BUDDY_KEY_DOWN, 9200, &action);
+    assert(state.page == BUDDY_PAGE_MUSIC);
+    assert(strcmp(action.macboard_action, "music") == 0);
+    /* 播放列表数据只在音乐页打开播放列表 */
+    page_heartbeat_at(&state, "playlist", 9300);
+    assert(state.page == BUDDY_PAGE_MUSIC && state.music_playlist_open);
+    state.music_playlist_open = false;
+
+    /* 编译页 OK = PLAY：上行 build start，不换页 */
+    state.page = BUDDY_PAGE_BUILD;
+    state.running = 0;
+    memset(&action, 0, sizeof(action));
+    memset(&event, 0, sizeof(event));
+    event.type = BUDDY_EVENT_KEY_CLICK;
+    event.key = BUDDY_KEY_OK;
+    buddy_state_reduce(&state, &event, 9400, &action);
+    assert(action.type == BUDDY_ACTION_MACBOARD_UPLINK);
+    assert(strcmp(action.macboard_cmd, "build") == 0 && strcmp(action.macboard_action, "start") == 0);
+    assert(state.page == BUDDY_PAGE_BUILD);
+
+    /* MacBoard 没有旧菜单：长按 OK / UP 在三页上都不打开菜单、不换页 */
+    {
+        static const buddy_page_t pages[] = {BUDDY_PAGE_MUSIC, BUDDY_PAGE_BUILD, BUDDY_PAGE_VOLUME};
+        unsigned i;
+        for (i = 0; i < sizeof(pages) / sizeof(pages[0]); ++i) {
+            state.page = pages[i];
+            long_key_at(&state, BUDDY_KEY_OK, 20000, &action);
+            assert(!state.menu_open && state.page == pages[i]);
+            assert(action.type != BUDDY_ACTION_MACBOARD_UPLINK);
+            long_key_at(&state, BUDDY_KEY_UP, 20000, &action);
+            assert(!state.menu_open && state.page == pages[i]);
+            key_event(&state, BUDDY_EVENT_KEY_CLICK, BUDDY_KEY_OK);
+            key_event(&state, BUDDY_EVENT_KEY_CLICK, BUDDY_KEY_UP);
+            key_event(&state, BUDDY_EVENT_KEY_CLICK, BUDDY_KEY_DOWN);
+            assert(!state.menu_open && state.page == pages[i]);
+        }
+    }
+
+    /* 万一处于旧页面（如旧状态残留），任意按键回到音乐页 */
+    state.page = BUDDY_PAGE_SETTINGS;
+    state.menu_open = true;
+    key_event(&state, BUDDY_EVENT_KEY_CLICK, BUDDY_KEY_OK);
+    assert(state.page == BUDDY_PAGE_MUSIC && !state.menu_open);
+}
+
 int main(void)
 {
     test_offline_initialization();
@@ -983,5 +1268,9 @@ int main(void)
     test_ble_security_events_update_owned_state_and_clear_sensitive_prompt();
     test_stale_security_mailbox_event_cannot_override_latest_link();
     test_new_link_generation_invalidates_sensitive_state_when_disconnect_was_coalesced();
+    test_macboard_build_phase();
+    test_macboard_build_ok_starts_once_while_running();
+    test_macboard_build_sound_edge();
+    test_macboard_volume_page();
     return 0;
 }

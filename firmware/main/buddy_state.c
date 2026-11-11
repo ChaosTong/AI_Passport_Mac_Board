@@ -248,7 +248,7 @@ static void buddy_settings_click(buddy_state_t *state, buddy_key_t key,
         break;
     case BUDDY_SETTINGS_BACK:
     case BUDDY_SETTINGS_COUNT:
-        state->page = BUDDY_PAGE_HOME;
+        state->page = state->macboard_companion ? BUDDY_PAGE_MUSIC : BUDDY_PAGE_HOME;
         buddy_set_ui_refresh(action);
         break;
     }
@@ -257,10 +257,22 @@ static void buddy_settings_click(buddy_state_t *state, buddy_key_t key,
 static void buddy_normal_click(buddy_state_t *state, buddy_key_t key,
                                buddy_action_t *action)
 {
+    if (state->macboard_companion) {
+        state->menu_open = false;
+    }
     if (buddy_macboard_handle_key(state, key, action)) {
         if (action == NULL || action->type == BUDDY_ACTION_NONE) {
             buddy_set_ui_refresh(action);
         }
+        return;
+    }
+    if (state->macboard_companion) {
+        /* MacBoard 只有 音乐 / 编译 / 音量 三页：旧菜单、SETTINGS、INFO、页面环一律不可达 */
+        if (state->page != BUDDY_PAGE_MUSIC && state->page != BUDDY_PAGE_BUILD &&
+            state->page != BUDDY_PAGE_VOLUME) {
+            state->page = BUDDY_PAGE_MUSIC;
+        }
+        buddy_set_ui_refresh(action);
         return;
     }
     if (state->menu_open) {
@@ -362,6 +374,15 @@ static void buddy_apply_heartbeat(buddy_state_t *state, const buddy_heartbeat_t 
         state->permission_delivery = BUDDY_PERMISSION_DELIVERY_NONE;
     }
     state->last_heartbeat_ms = now_ms;
+    if (state->macboard_companion && heartbeat->page[0] != '\0') {
+        /* 编译结果随每个页面的 heartbeat 下发：任何页都要能响提示音 */
+        buddy_macboard_track_build_result(state, heartbeat);
+        if (!buddy_macboard_heartbeat_for_page(state, heartbeat->page)) {
+            /* 板子是当前页的唯一来源：别的页的数据不显示、不换页，只告诉 Mac 板子在哪页 */
+            buddy_macboard_report_page(state, now_ms, action);
+            return;
+        }
+    }
     if (state->macboard_companion && heartbeat->page[0] != '\0' &&
         strcmp(heartbeat->page, "playlist") == 0) {
         state->music_playlist_open = true;
@@ -385,21 +406,6 @@ static void buddy_apply_heartbeat(buddy_state_t *state, const buddy_heartbeat_t 
     state->tokens_today = heartbeat->tokens_today;
     buddy_copy(state->message, sizeof(state->message), heartbeat->message);
     buddy_copy_entries(state->entries, heartbeat->entries);
-
-    if (state->macboard_companion && heartbeat->page[0] != '\0') {
-        const bool build_page = strcmp(heartbeat->page, "build") == 0;
-        if (build_page && heartbeat->message[0] != '\0' &&
-            strcmp(state->last_build_msg, heartbeat->message) != 0) {
-            if (strcmp(heartbeat->message, "success") == 0 ||
-                strcmp(heartbeat->message, "failure") == 0) {
-                if (action != NULL) {
-                    action->type = BUDDY_ACTION_SOUND_CUE;
-                }
-            }
-            buddy_copy(state->last_build_msg, sizeof(state->last_build_msg), heartbeat->message);
-        }
-        buddy_macboard_apply_page_wire(state, heartbeat->page);
-    }
 
     if (level > state->highest_celebrated_level) {
         state->highest_celebrated_level = level;
@@ -522,7 +528,7 @@ void buddy_state_init(buddy_state_t *state, const buddy_settings_snapshot_t *set
     }
     state->macboard_companion = buddy_macboard_owner_is_companion(state->owner);
     if (state->macboard_companion) {
-        state->page = BUDDY_PAGE_MUSIC;
+        buddy_macboard_restore_page(state);
     }
     buddy_refresh_character(state, 0);
 }
@@ -560,19 +566,33 @@ void buddy_state_reduce(buddy_state_t *state, const buddy_event_t *event,
         break;
     case BUDDY_EVENT_OWNER:
         buddy_copy(state->owner, sizeof(state->owner), event->command.value);
-        state->macboard_companion = buddy_macboard_owner_is_companion(state->owner);
-        if (state->macboard_companion) {
-            state->page = BUDDY_PAGE_MUSIC;
+        {
+            const bool was_companion = state->macboard_companion;
+            state->macboard_companion = buddy_macboard_owner_is_companion(state->owner);
+            if (state->macboard_companion && !was_companion) {
+                buddy_macboard_restore_page(state);
+            }
         }
         buddy_set_ui_refresh(action);
         break;
     case BUDDY_EVENT_HOST_ACK:
-        if (state->settings.sound_enabled && event->host_ack.ack_ok) {
+        /* MacBoard：按键已有一声 click，Mac 的 ack 不再追加双音提示（否则一次按键“嘟嘟嘟”） */
+        if (state->settings.sound_enabled && event->host_ack.ack_ok && !state->macboard_companion) {
             if (action != NULL) {
                 action->type = BUDDY_ACTION_SOUND_CUE;
             }
         }
         buddy_set_ui_refresh(action);
+        break;
+    case BUDDY_EVENT_SOUND:
+        /* 试听：不受 SOUND 开关限制（用户明确要求播放） */
+        if (strcmp(event->command.value, "build_success") == 0) {
+            state->build_sound_pending = BUDDY_BUILD_SOUND_SUCCESS;
+            state->build_sound_force = true;
+        } else if (strcmp(event->command.value, "build_failure") == 0) {
+            state->build_sound_pending = BUDDY_BUILD_SOUND_FAILURE;
+            state->build_sound_force = true;
+        }
         break;
     case BUDDY_EVENT_STATUS:
         buddy_copy(state->message, sizeof(state->message), event->command.value);
@@ -603,6 +623,7 @@ void buddy_state_reduce(buddy_state_t *state, const buddy_event_t *event,
         state->ble_connection_generation = event->ble.connection_generation;
         state->ble_connected = true;
         state->ble_encrypted = false;
+        state->build_sound_armed = false; /* 重连后的第一个结果只当基线 */
         if (state->confirmation == BUDDY_CONFIRM_NONE) {
             state->connection = BUDDY_CONNECTION_PAIRING;
         }
@@ -615,6 +636,7 @@ void buddy_state_reduce(buddy_state_t *state, const buddy_event_t *event,
         state->passkey_visible = false;
         state->connected = false;
         state->heartbeat_stale = true;
+        state->build_sound_armed = false;
         buddy_clear_logical_session(state);
         if (state->confirmation_acknowledge) {
             buddy_close_confirmation(state);
@@ -704,6 +726,17 @@ void buddy_state_reduce(buddy_state_t *state, const buddy_event_t *event,
         }
         break;
     case BUDDY_EVENT_KEY_LONG:
+        if (state->confirmation == BUDDY_CONFIRM_NONE && !buddy_has_prompt(state) &&
+            buddy_macboard_handle_long_key(state, event->key, now_ms, action)) {
+            if (action == NULL || action->type == BUDDY_ACTION_NONE) {
+                buddy_set_ui_refresh(action);
+            }
+            break;
+        }
+        if (state->macboard_companion) {
+            /* MacBoard：长按 OK 不再打开旧菜单（长按 DOWN 切页由上面处理） */
+            break;
+        }
         if (event->key == BUDDY_KEY_OK && state->confirmation == BUDDY_CONFIRM_NONE &&
             !buddy_has_prompt(state)) {
             state->menu_open = !state->menu_open;
@@ -777,6 +810,8 @@ void buddy_state_snapshot(const buddy_state_t *state, buddy_ui_snapshot_t *snaps
     snapshot->music_playlist_open = state->music_playlist_open;
     snapshot->music_playlist_pick = state->music_playlist_pick;
     snapshot->music_playlist_window = state->music_playlist_window;
+    snapshot->volume = state->settings.volume;
+    snapshot->volume_pick = state->volume_pick;
     buddy_copy(snapshot->name, sizeof(snapshot->name), state->name);
     buddy_copy(snapshot->owner, sizeof(snapshot->owner), state->owner);
     buddy_copy(snapshot->time, sizeof(snapshot->time), state->time);

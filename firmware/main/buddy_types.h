@@ -43,6 +43,8 @@ typedef enum {
     BUDDY_PAGE_SETTINGS,
     BUDDY_PAGE_MUSIC,
     BUDDY_PAGE_BUILD,
+    /* MacBoard 本地音量页（长按 DOWN 进入），不受 Mac heartbeat 的 page 覆盖 */
+    BUDDY_PAGE_VOLUME,
 } buddy_page_t;
 
 typedef enum {
@@ -110,6 +112,8 @@ typedef enum {
     BUDDY_EVENT_KEY_LONG,
     BUDDY_EVENT_HOST_ACK,
     BUDDY_EVENT_TICK,
+    /* MacBoard 下行 {"cmd":"sound","name":"build_success"|"build_failure"}：试听编译音效 */
+    BUDDY_EVENT_SOUND,
 } buddy_event_type_t;
 
 typedef enum {
@@ -164,6 +168,9 @@ typedef struct {
     unsigned waiting;
     uint64_t tokens;
     uint64_t tokens_today;
+    /* MacBoard：最近一次编译结果 "success"/"failure"（bres）与结束时间 id（bid，epoch ms）。 */
+    char build_result[BUDDY_COMMAND_MAX];
+    uint64_t build_id;
     bool connected;
     bool message_truncated;
     bool entries_truncated[BUDDY_ENTRY_COUNT];
@@ -189,7 +196,23 @@ typedef struct {
     uint64_t highest_celebrated_level;
     bool ble_enabled;
     bool sound_enabled;
+    /* 喇叭音量档位：只有 0 / 50 / 100（NVS "volume"，默认 50）；0 = 完全静音 */
+    uint8_t volume;
+    /* MacBoard 当前页（板子是唯一来源，NVS "mbpage"）：0 音乐 / 1 编译 / 2 音量，默认音乐 */
+    uint8_t macboard_page;
 } buddy_settings_snapshot_t;
+
+#define BUDDY_MACBOARD_PAGE_MUSIC 0U
+#define BUDDY_MACBOARD_PAGE_BUILD 1U
+#define BUDDY_MACBOARD_PAGE_VOLUME 2U
+
+#define BUDDY_DEFAULT_VOLUME 50U
+
+/* 任意 0–100 吸附到最近的档位 0 / 50 / 100（25 / 75 向上取）。 */
+static inline uint8_t buddy_volume_snap(unsigned volume)
+{
+    return volume < 25U ? 0U : (volume < 75U ? 50U : 100U);
+}
 
 typedef struct {
     uint32_t passkey;
@@ -303,4 +326,7 @@ typedef struct {
     bool music_playlist_open;
     uint16_t music_playlist_pick;
     uint16_t music_playlist_window;
+    /** 音量页：已保存的档位与当前高亮档位（0 / 50 / 100）。 */
+    uint8_t volume;
+    uint8_t volume_pick;
 } buddy_ui_snapshot_t;

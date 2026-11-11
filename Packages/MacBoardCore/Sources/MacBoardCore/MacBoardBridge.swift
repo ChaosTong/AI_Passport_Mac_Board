@@ -42,6 +42,10 @@ public final class MacBoardBridge: NSObject, ObservableObject {
     @Published public private(set) var nowPlaying: NowPlayingSnapshot = .idle
     @Published public private(set) var buildStatus: BirkinBuildStatus = .idle
     @Published public private(set) var buildErrorLines: [String] = []
+    /// 编译过程时间线（"mm:ss 文案"，按时间顺序，最多 `FieldLimits.entryCount` 条），推给板子上半部。
+    @Published public private(set) var buildProcessLines: [String] = []
+    @Published public private(set) var buildStartedAt: Date?
+    @Published public private(set) var buildFinishedAt: Date?
     @Published public var passportDisplayName: String = "Passport" {
         didSet {
             let trimmed = passportDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -69,9 +73,18 @@ public final class MacBoardBridge: NSObject, ObservableObject {
     private var keepaliveTimer: Timer?
     private var secureProbeTimer: Timer?
     private var musicPollTimer: Timer?
-    private var buildPollTimer: Timer?
+    /// 编译中的兜底：30s 没收到 Birkin 推送就一次性核对 birkinStatus（不周期轮询）
+    private var buildWatchdogTimer: Timer?
+    private var lastBuildProgress: String?
+    private var lastBuildProgressShape: String?
+    private var lastBuildProgressAt: Date?
+    /// 已处理的 Birkin 推送 seq（去重 / 连接时补齐用）
+    private var birkinSeq = 0
     private var didLogSecureWait = false
     private var autoReconnectEnabled = true
+    /// 断开后的自动重连：指数退避（2s → 4s → … 最多 30s）反复尝试，链路就绪后清零；用户在菜单里点「断开」则停止。
+    private var reconnectTimer: Timer?
+    private var reconnectAttempts = 0
     private var lastMusicSnapshot: NowPlayingSnapshot?
     private var playlistPickerActive = false
     private var playlistName = ""
@@ -86,10 +99,17 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         self.central = NUSCentralManager(namePrefix: namePrefix)
         super.init()
         self.central.delegate = self
+        // Birkin（Hammerspoon）主动推送构建文案：分布式通知，零轮询
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(onBirkinNotification(_:)),
+            name: birkinProgressNotification, object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
     }
 
     public func bootstrap() {
         attemptAutoReconnectIfNeeded(reason: "launch")
+        scheduleReconnect(reason: "launch")
     }
 
     public func startScanning() {
@@ -123,6 +143,8 @@ public final class MacBoardBridge: NSObject, ObservableObject {
 
     public func disconnect() {
         autoReconnectEnabled = false
+        cancelReconnect()
+        central.stopScanning()
         stopTimers()
         linkSecure = false
         central.disconnect()
@@ -139,7 +161,8 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         sendCommand(.unpair)
     }
 
-    public func setActivePage(_ page: MacBoardPage) {
+    /// 板子上报当前页（{"cmd":"page"}）后跟随：板子是页面的唯一来源，Mac 从不主动切页。
+    private func followBoardPage(_ page: MacBoardPage) {
         activePage = page
         pushCurrentHeartbeat()
     }
@@ -148,6 +171,20 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         Task {
             await refreshMusicAndPushIfNeeded(force: true)
         }
+    }
+
+    /// 让板子试听编译音效（下行 {"cmd":"sound","name":"build_success"|"build_failure"}，不受板子 SOUND 开关影响）。
+    public func previewBuildSound(success: Bool) {
+        guard phase == .ready else {
+            appendLog("试听音效：板子未连接")
+            return
+        }
+        let name = success ? "build_success" : "build_failure"
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: ["cmd": "sound", "name": name], options: [.sortedKeys]
+        ) else { return }
+        sendRaw(data, note: "sound \(name)")
+        appendLog("试听 \(name)")
     }
 
     public func triggerTestBuild() {
@@ -187,6 +224,46 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         }
     }
 
+    /// 安排下一次自动重连（退避：2, 4, 8, 16, 30, 30… 秒）。
+    private func scheduleReconnect(reason: String) {
+        guard autoReconnectEnabled, lastKnownDevice != nil else { return }
+        reconnectTimer?.invalidate()
+        let delay = min(30.0, 2.0 * pow(2.0, Double(min(reconnectAttempts, 4))))
+        reconnectAttempts += 1
+        appendLog("\(Int(delay))s 后自动重连（\(reason)，第 \(reconnectAttempts) 次）")
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.reconnectTimerFired(reason: reason) }
+        }
+    }
+
+    private func reconnectTimerFired(reason: String) {
+        reconnectTimer = nil
+        guard autoReconnectEnabled else { return }
+        switch phase {
+        case .ready, .bluetoothOff:
+            return
+        case .connected:
+            // 正在协商加密：再等一轮，不打断
+            scheduleReconnect(reason: reason)
+            return
+        case .scanning, .connecting:
+            // 上一轮没连上：重新发起（停扫 → 按 UUID 直连 + 扫描兜底）
+            central.stopScanning()
+            phase = .idle
+        case .idle:
+            break
+        }
+        attemptAutoReconnectIfNeeded(reason: reason)
+        // 本轮若仍未就绪，下一轮继续（退避递增）
+        scheduleReconnect(reason: reason)
+    }
+
+    private func cancelReconnect() {
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        reconnectAttempts = 0
+    }
+
     private func maybeAutoConnectDiscovered(id: UUID, name: String?) {
         guard autoReconnectEnabled else { return }
         guard phase == .scanning || phase == .idle || phase == .connecting else { return }
@@ -208,6 +285,7 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         linkSecure = true
         stopSecureProbe()
         phase = .ready
+        cancelReconnect()
         appendLog("链路加密就绪 (\(source))")
         sendRaw((try? RawWireValidator.timeSyncJSON()) ?? Data(), note: "time")
         sendCommand(.owner, name: ownerName)
@@ -278,23 +356,124 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         musicPollTimer = nil
     }
 
-    private func startBuildPolling() {
-        stopBuildPolling()
-        buildPollTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.pollBuildStatus() }
+    // MARK: - Birkin 推送
+
+    @objc private nonisolated func onBirkinNotification(_ note: Notification) {
+        guard let line = HammerspoonBuildService.progressLine(fromUserInfo: note.userInfo) else { return }
+        Task { @MainActor in self.handleBirkinLine(line, live: true) }
+    }
+
+    private var isTrackingBuild: Bool {
+        buildStartedAt != nil && buildFinishedAt == nil
+    }
+
+    /// 处理一条 Birkin 文案：按 state 推进编译状态，文案追加到时间线，并推给板子。
+    private func handleBirkinLine(_ line: BirkinProgressLine, live: Bool) {
+        if line.seq > 0 {
+            // 实时推送按到达顺序处理（Hammerspoon 重载后 seq 会从 1 重新开始）；只有补齐时去重
+            if !live && line.seq <= birkinSeq { return }
+            if line.state != "hidden" { birkinSeq = line.seq }
+        }
+        switch line.state {
+        case "busy":
+            if !isTrackingBuild {
+                // 外部触发（Xcode ⌘B / ⌥R）：开新时间线
+                buildErrorLines = []
+                beginBuildTimeline(note: nil)
+            }
+            buildStatus = .busy
+            appendBirkinText(line.text, throttle: true)
+            armBuildWatchdog()
+        case "success":
+            appendBirkinText(line.text, throttle: false)
+            finishBuild(.success, note: line.text.isEmpty)
+        case "failure":
+            appendBirkinText(line.text, throttle: false)
+            if buildStatus != .failure || isTrackingBuild {
+                finishBuild(.failure, note: line.text.isEmpty)
+            }
+        case "idle":
+            appendBirkinText(line.text, throttle: false)
+            if buildStatus.isBuilding { finishBuild(.idle, note: line.text.isEmpty) }
+        case "hidden":
+            // 菜单栏被收起：编译中（非刚按下 PLAY 的 starting）即视为取消
+            if buildStatus == .busy {
+                appendBuildProcess("canceled")
+                finishBuild(.idle, note: false)
+            }
+        default:
+            appendBirkinText(line.text, throttle: false)
+        }
+        // 编译页实时推；结束态（成功 / 失败）在任何页面都推一次，让板子及时播放提示音
+        let finished = line.state == "success" || line.state == "failure"
+        if live, phase == .ready, activePage == .build || finished {
+            pushCurrentHeartbeat()
         }
     }
 
-    private func stopBuildPolling() {
-        buildPollTimer?.invalidate()
-        buildPollTimer = nil
+    /// 追加 Birkin 文案。busy 进度（如 "Planning 7533/7610"）每 0.35s 变一次：
+    /// 去掉数字后形状相同且 3s 内的不重复追加，避免刷屏。
+    private func appendBirkinText(_ text: String, throttle: Bool) {
+        guard !text.isEmpty, text != lastBuildProgress else { return }
+        let shape = text.filter { !$0.isNumber }
+        let now = Date()
+        if throttle, shape == lastBuildProgressShape,
+           let at = lastBuildProgressAt, now.timeIntervalSince(at) < 3 {
+            return
+        }
+        lastBuildProgress = text
+        lastBuildProgressShape = shape
+        lastBuildProgressAt = now
+        appendBuildProcess(text)
+    }
+
+    private func finishBuild(_ status: BirkinBuildStatus, note: Bool) {
+        buildStatus = status
+        stopBuildWatchdog()
+        if isTrackingBuild {
+            buildFinishedAt = Date()
+            if note { appendBuildProcess(status.rawValue) }
+        }
+        if status == .failure {
+            // 失败后一次性取错误摘要
+            Task { @MainActor in
+                buildErrorLines = await buildService.errorLines()
+                if phase == .ready, activePage == .build { pushCurrentHeartbeat() }
+            }
+        } else if status == .success {
+            buildErrorLines = []
+        }
+    }
+
+    private func armBuildWatchdog() {
+        stopBuildWatchdog()
+        buildWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in
+            Task { @MainActor in await self?.buildWatchdogFired() }
+        }
+    }
+
+    private func stopBuildWatchdog() {
+        buildWatchdogTimer?.invalidate()
+        buildWatchdogTimer = nil
+    }
+
+    /// 30s 没有推送（Birkin 未加载 / Hammerspoon 重载 / 推送丢失）：一次性核对状态。
+    private func buildWatchdogFired() async {
+        buildWatchdogTimer = nil
+        guard buildStatus.isBuilding else { return }
+        let status = await buildService.status()
+        if status.isBuilding {
+            armBuildWatchdog()
+            return
+        }
+        finishBuild(status, note: true)
+        if phase == .ready { pushCurrentHeartbeat() }
     }
 
     private func stopTimers() {
         stopKeepalive()
         stopSecureProbe()
         stopMusicPolling()
-        stopBuildPolling()
     }
 
     private func pushCurrentHeartbeat() {
@@ -310,15 +489,25 @@ public final class MacBoardBridge: NSObject, ObservableObject {
     }
 
     private func currentHeartbeatSnapshot() -> HeartbeatSnapshot {
+        var snapshot: HeartbeatSnapshot
         if playlistPickerActive, activePage == .music {
-            return playlistHeartbeat()
+            snapshot = playlistHeartbeat()
+        } else {
+            switch activePage {
+            case .music:
+                snapshot = musicHeartbeat()
+            case .build:
+                snapshot = buildHeartbeat()
+            case .volume:
+                snapshot = HeartbeatSnapshot(page: MacBoardPage.volume.rawValue, tokens: 0, tokensToday: 0)
+            }
         }
-        switch activePage {
-        case .music:
-            return musicHeartbeat()
-        case .build:
-            return buildHeartbeat()
+        // 编译结果随每个页面的 heartbeat 下发：板子在音乐页也能播放成功 / 失败音效
+        if let finished = buildFinishedAt, buildStatus == .success || buildStatus == .failure {
+            snapshot.buildResult = buildStatus.rawValue
+            snapshot.buildId = Int(finished.timeIntervalSince1970 * 1000)
         }
+        return snapshot
     }
 
     private func playlistHeartbeat() -> HeartbeatSnapshot {
@@ -359,15 +548,20 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         )
     }
 
+    /// page=build：msg 状态；running 编译中；waiting = 本次编译耗时 ms（结束后冻结）；
+    /// entries = 失败时错误行，否则过程时间线（最新在末尾）。
     private func buildHeartbeat() -> HeartbeatSnapshot {
-        let lines = FieldLimits.truncateEntries(buildErrorLines.map {
+        let source = (buildStatus == .failure && !buildErrorLines.isEmpty)
+            ? buildErrorLines
+            : Array(buildProcessLines.suffix(FieldLimits.entryCount))
+        let lines = FieldLimits.truncateEntries(source.map {
             FieldLimits.truncate($0, max: FieldLimits.entryMax) ?? $0
         })
         return HeartbeatSnapshot(
             page: MacBoardPage.build.rawValue,
             total: lines.count,
             running: buildStatus.isBuilding ? 1 : 0,
-            waiting: 0,
+            waiting: buildElapsedMilliseconds(),
             msg: buildStatus.rawValue,
             entries: lines.isEmpty ? nil : lines,
             tokens: 0,
@@ -392,31 +586,57 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         }
     }
 
+    /// 连接就绪时一次性同步编译状态；若正在编译，用 birkinProgressLines 补齐本轮已显示的文案。
     private func refreshBuildSnapshot() async {
         let status = await buildService.status()
-        buildStatus = status
         if status == .failure {
             buildErrorLines = await buildService.errorLines()
         } else if status == .success {
             buildErrorLines = []
         }
+        if status.isBuilding, !isTrackingBuild {
+            beginBuildTimeline(note: status.rawValue)
+            if let catchUp = await buildService.progressLines(since: 0) {
+                // 只补最近一段（从最后一次非 busy 之后开始）
+                let tail = catchUp.lines.reversed().prefix { $0.state == "busy" || $0.state == "info" }
+                for line in tail.reversed() {
+                    handleBirkinLine(line, live: false)
+                }
+                birkinSeq = catchUp.latestSeq
+            }
+            armBuildWatchdog()
+        } else if let catchUp = await buildService.progressLines(since: 0) {
+            birkinSeq = catchUp.latestSeq
+        }
+        buildStatus = status.isBuilding ? .busy : status
         if phase == .ready, activePage == .build {
             pushCurrentHeartbeat()
         }
     }
 
-    private func pollBuildStatus() async {
-        let status = await buildService.status()
-        buildStatus = status
-        if status == .failure {
-            buildErrorLines = await buildService.errorLines()
+    private func beginBuildTimeline(note: String?) {
+        buildStartedAt = Date()
+        buildFinishedAt = nil
+        buildProcessLines = []
+        lastBuildProgress = nil
+        if let note {
+            appendBuildProcess(note)
         }
-        if phase == .ready, activePage == .build {
-            pushCurrentHeartbeat()
+    }
+
+    private func appendBuildProcess(_ text: String) {
+        let seconds = Int(buildElapsedMilliseconds() / 1000)
+        let line = String(format: "%02d:%02d %@", (seconds / 60) % 100, seconds % 60, text)
+        buildProcessLines.append(FieldLimits.truncate(line, max: FieldLimits.entryMax) ?? line)
+        if buildProcessLines.count > FieldLimits.entryCount {
+            buildProcessLines.removeFirst(buildProcessLines.count - FieldLimits.entryCount)
         }
-        if status.isTerminal {
-            stopBuildPolling()
-        }
+    }
+
+    private func buildElapsedMilliseconds() -> Int {
+        guard let start = buildStartedAt else { return 0 }
+        let end = buildFinishedAt ?? Date()
+        return max(0, Int(end.timeIntervalSince(start) * 1000))
     }
 
     private func handleMediaCommand(action: String) async {
@@ -518,6 +738,13 @@ public final class MacBoardBridge: NSObject, ObservableObject {
     }
 
     private func handleBuildStart(fromBoard: Bool) async {
+        if buildStatus.isBuilding, isTrackingBuild {
+            // 正在编译：不重复 ⌘B（板子侧也会在编译中屏蔽 PLAY）
+            appendLog("birkinBuild 跳过：编译进行中")
+            sendAck(.build, ok: false, error: "busy")
+            pushCurrentHeartbeat()
+            return
+        }
         let result = await buildService.triggerBuild()
         appendLog("birkinBuild → \(result)")
         let lowered = result.lowercased()
@@ -525,16 +752,20 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         if !ok {
             sendAck(.build, ok: false, error: "no-xcode")
             buildStatus = .noXcode
+            buildStartedAt = nil
+            buildFinishedAt = nil
+            buildProcessLines = ["00:00 Xcode not running"]
             pushCurrentHeartbeat()
             return
         }
+        beginBuildTimeline(note: fromBoard ? "PLAY: birkinBuild()" : "birkinBuild()")
         buildStatus = .starting
         buildErrorLines = []
-        activePage = .build
+        // 不切板子页面：编译结果 bres/bid 随任何页的 heartbeat 下发，提示音照样响
         sendAck(.build, ok: true, error: nil)
         pushCurrentHeartbeat()
-        startBuildPolling()
-        await pollBuildStatus()
+        // 之后的进度 / 结果全部由 Birkin 推送；只留 30s 兜底核对
+        armBuildWatchdog()
     }
 
     private func sendAck(_ ack: BoardWireAck, ok: Bool, error: String?) {
@@ -585,6 +816,12 @@ public final class MacBoardBridge: NSObject, ObservableObject {
                 let action = jsonString(payload["action"]) ?? ""
                 if action == "start" {
                     Task { await handleBuildStart(fromBoard: true) }
+                }
+            case "page":
+                // 板子长按 DOWN 切页 / 收到别的页的数据时上报当前页：Mac 跟随并推这一页的数据
+                if let page = MacBoardPage(rawValue: jsonString(payload["action"]) ?? "") {
+                    if page != activePage { playlistPickerActive = false }
+                    followBoardPage(page)
                 }
             default:
                 break
@@ -664,6 +901,12 @@ extension MacBoardBridge: NUSCentralDelegate {
             phase = .idle
             connectedName = nil
             appendLog("断开: \(error?.localizedDescription ?? "ok")")
+            // 板子复位 / 重刷 / 链路掉线：自动重连（用户主动断开时 autoReconnectEnabled=false）
+            if autoReconnectEnabled {
+                reconnectAttempts = 0
+                attemptAutoReconnectIfNeeded(reason: "disconnect")
+                scheduleReconnect(reason: "disconnect")
+            }
         }
     }
 
@@ -678,6 +921,9 @@ extension MacBoardBridge: NUSCentralDelegate {
     nonisolated public func nusCentral(_ central: NUSCentralManager, didFailWith error: Error) {
         Task { @MainActor in
             appendLog("BLE 错误: \(error.localizedDescription)")
+            if phase == .connecting, autoReconnectEnabled, reconnectTimer == nil {
+                scheduleReconnect(reason: "connect-failed")
+            }
         }
     }
 }

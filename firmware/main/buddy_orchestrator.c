@@ -81,6 +81,17 @@ bool buddy_orchestrator_process_rx(buddy_state_t *state,
                   : ops->commit_owner(ops->context, event.command.value);
     }
 
+    if (event.type == BUDDY_EVENT_SOUND) {
+        const bool known = strcmp(event.command.value, "build_success") == 0 ||
+                           strcmp(event.command.value, "build_failure") == 0;
+
+        if (known) {
+            buddy_state_reduce(state, &event, now_ms, action);
+        }
+        return buddy_orchestrator_send_ack(ops, event.command.name, known,
+                                           known ? NULL : "unknown sound",
+                                           connection_generation) == ESP_OK && known;
+    }
     if (err == ESP_OK) {
         buddy_state_reduce(state, &event, now_ms, action);
         if (event.type == BUDDY_EVENT_NAME) {

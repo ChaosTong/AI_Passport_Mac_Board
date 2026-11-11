@@ -258,6 +258,21 @@ static bool buddy_parse_companion_heartbeat(const cJSON *object, buddy_event_t *
         return false;
     }
     event->heartbeat.connected = true;
+    event->heartbeat.build_result[0] = '\0';
+    event->heartbeat.build_id = 0;
+    {
+        const char *bres;
+        size_t bres_length;
+
+        if (buddy_json_optional_string(object, "bres", &bres, &bres_length) && bres != NULL &&
+            bres_length < sizeof(event->heartbeat.build_result)) {
+            (void)buddy_copy_utf8(event->heartbeat.build_result,
+                                  sizeof(event->heartbeat.build_result), bres, bres_length, NULL);
+        }
+        if (!buddy_json_u64(object, "bid", &event->heartbeat.build_id)) {
+            event->heartbeat.build_id = 0;
+        }
+    }
     memset(event->heartbeat.entries, 0, sizeof(event->heartbeat.entries));
 
     entries = cJSON_GetObjectItemCaseSensitive(object, "entries");
@@ -567,6 +582,8 @@ int buddy_protocol_parse(const char *json, size_t length, buddy_event_t *event)
     } else if (strcmp(command, "unpair") == 0) {
         event->type = BUDDY_EVENT_UNPAIR_CONFIRMATION;
         result = (int)event->type;
+    } else if (strcmp(command, "sound") == 0) {
+        result = buddy_parse_command(root, "name", BUDDY_EVENT_SOUND, event) ? (int)event->type : result;
     } else if (buddy_is_unsupported_folder_command(command)) {
         result = BUDDY_EVENT_UNSUPPORTED_COMMAND;
     } else {

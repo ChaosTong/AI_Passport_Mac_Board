@@ -52,8 +52,6 @@ static int s_battery_bars = -1;
 static uint32_t s_position_base_ms;
 static uint64_t s_position_base_at_ms;
 
-LV_DRAW_BUF_DEFINE_STATIC(s_clock_draw_buf, EVA_CLOCK_WIDTH, EVA_CLOCK_HEIGHT, LV_COLOR_FORMAT_A8);
-
 static lv_obj_t *panel(lv_obj_t *parent, int x, int y, int w, int h, uint32_t bg, uint32_t border)
 {
     return eva_player_frame_panel(parent, x, y, w, h, bg, border);
@@ -61,29 +59,14 @@ static lv_obj_t *panel(lv_obj_t *parent, int x, int y, int w, int h, uint32_t bg
 
 static void make_button(lv_obj_t *parent, int index, const lv_image_dsc_t *icon, int x)
 {
-    s_buttons[index] = panel(parent, x, 266, 52, 30, COLOR_BG, COLOR_ORANGE);
-    lv_obj_t *img = lv_image_create(s_buttons[index]);
-    lv_image_set_src(img, icon);
-    lv_obj_set_style_image_recolor(img, lv_color_hex(COLOR_ORANGE), 0);
-    lv_obj_set_style_image_recolor_opa(img, LV_OPA_COVER, 0);
-    lv_obj_center(img);
-    s_button_icons[index] = img;
-}
-
-static int battery_bar_count(unsigned percent)
-{
-    if (percent == 0) return 0;
-    if (percent <= 33) return 1;
-    if (percent <= 66) return 2;
-    return 3;
+    s_buttons[index] = eva_player_frame_button(parent, x, icon, &s_button_icons[index]);
 }
 
 static void update_button_styles(uint8_t focus)
 {
     int active = (focus < 4) ? (int)focus : 1;
     for (int i = 0; i < 4; i++) {
-        uint32_t bg = active == i ? COLOR_MAGENTA : COLOR_BG;
-        lv_obj_set_style_bg_color(s_buttons[i], lv_color_hex(bg), 0);
+        eva_player_frame_button_style(s_buttons[i], s_button_icons[i], active == i, true);
     }
 }
 
@@ -140,7 +123,8 @@ static void draw_clock(const buddy_ui_snapshot_t *snapshot, uint64_t elapsed_ms)
         s_last_running == snapshot->running) {
         return;
     }
-    if (eva_clock_render_a8(s_clock_draw_buf.data, s_clock_draw_buf.header.stride, remaining)) {
+    lv_draw_buf_t *buf = eva_player_frame_clock_buf();
+    if (eva_clock_render_a8(buf->data, buf->header.stride, remaining)) {
         s_last_drawn_remaining = remaining;
         s_last_running = snapshot->running;
         lv_obj_invalidate(s_clock);
@@ -248,7 +232,7 @@ static void update_battery(const buddy_ui_snapshot_t *snapshot)
 {
     int bars;
     if (!s_battery_image) return;
-    bars = snapshot->battery_available ? battery_bar_count(snapshot->battery_percent) : 0;
+    bars = snapshot->battery_available ? eva_player_frame_battery_bars(snapshot->battery_percent) : 0;
     if (bars == s_battery_bars) return;
     eva_player_frame_battery(s_battery_image, bars);
     s_battery_bars = bars;
@@ -266,9 +250,8 @@ static void build_screen(void)
 
     s_battery_image = eva_player_frame_header(s_scr, NULL, NULL);
 
-    LV_DRAW_BUF_INIT_STATIC(s_clock_draw_buf);
     s_clock = lv_canvas_create(s_scr);
-    lv_canvas_set_draw_buf(s_clock, &s_clock_draw_buf);
+    lv_canvas_set_draw_buf(s_clock, eva_player_frame_clock_buf());
     lv_obj_set_pos(s_clock, 8, 106);
     lv_obj_set_style_image_recolor(s_clock, lv_color_hex(COLOR_ORANGE), 0);
     lv_obj_set_style_image_recolor_opa(s_clock, LV_OPA_COVER, 0);
@@ -315,7 +298,7 @@ static void build_screen(void)
     lv_label_set_text(s_track_label, "—");
     lv_obj_center(s_track_label);
 
-    panel(s_scr, 3, 258, 234, 45, COLOR_GREEN, COLOR_ORANGE);
+    eva_player_frame_control_bar(s_scr);
     make_button(s_scr, 0, &eva_text_btn_prev, 5);
     make_button(s_scr, 1, &eva_text_btn_play, 64);
     make_button(s_scr, 2, &eva_text_btn_next, 123);
@@ -325,9 +308,38 @@ static void build_screen(void)
     s_built = true;
 }
 
+/* 隐藏即销毁：LVGL 内置堆放不下音乐屏 + 编译屏 + i4 屏同时常驻（会在 lv_array_resize 断言卡死 → 白屏）。 */
+static void destroy_screen(void)
+{
+    if (!s_built) return;
+    lv_obj_delete(s_scr);
+    s_scr = NULL;
+    s_clock = NULL;
+    s_battery_image = NULL;
+    memset(s_buttons, 0, sizeof(s_buttons));
+    memset(s_button_icons, 0, sizeof(s_button_icons));
+    s_track_panel = NULL;
+    s_track_label = NULL;
+    s_playlist_title_panel = NULL;
+    s_playlist_title = NULL;
+    memset(s_playlist_rows, 0, sizeof(s_playlist_rows));
+    memset(s_playlist_row_labels, 0, sizeof(s_playlist_row_labels));
+    s_last_list_pick = UINT16_MAX;
+    s_last_list_window = UINT16_MAX;
+    memset(s_last_list_rows, 0, sizeof(s_last_list_rows));
+    s_last_list_title[0] = '\0';
+    s_last_title[0] = '\0';
+    s_last_artist[0] = '\0';
+    s_last_drawn_remaining = UINT32_MAX;
+    s_last_running = UINT32_MAX;
+    s_last_toggle_running = UINT32_MAX;
+    s_battery_bars = -1;
+    s_built = false;
+}
+
 void buddy_eva_music_init(void)
 {
-    build_screen();
+    /* 按需创建：真正显示时才 build_screen()。 */
 }
 
 bool buddy_eva_music_active(void)
@@ -342,22 +354,27 @@ void buddy_eva_music_register_i4_screen(lv_obj_t *screen)
 
 void buddy_eva_music_set_visible(bool visible)
 {
-    if (!s_built) buddy_eva_music_init();
     if (visible == s_visible) return;
     s_visible = visible;
     if (visible) {
+        build_screen();
         lv_screen_load(s_scr);
-    } else if (s_i4_screen) {
-        lv_screen_load(s_i4_screen);
+        eva_player_frame_log_mem("music shown");
+    } else {
+        if (s_i4_screen) {
+            lv_screen_load(s_i4_screen);
+        }
+        destroy_screen();
     }
+    /* 计时器缓冲与编译页共用：重新显示时必须整幅重绘。 */
     s_last_drawn_remaining = UINT32_MAX;
+    s_last_running = UINT32_MAX;
 }
 
 void buddy_eva_music_update(const buddy_ui_snapshot_t *snapshot, uint64_t elapsed_ms)
 {
     static uint32_t s_last_wait;
-    if (!s_built) buddy_eva_music_init();
-    if (!snapshot || !s_visible) return;
+    if (!snapshot || !s_visible || !s_built) return;
 
     if (snapshot->music_playlist_open) {
         set_now_playing_visible(false);

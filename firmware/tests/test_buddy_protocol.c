@@ -409,8 +409,25 @@ static void test_task_tx_capacity_handles_worst_case_escaping(void)
     assert(buddy_protocol_device_status_json(json, sizeof(json), &status) > 0);
 }
 
+static void test_companion_heartbeat_build_result(void)
+{
+    buddy_event_t event = {0};
+
+    assert(parse("{\"page\":\"music\",\"msg\":\"x\",\"bres\":\"success\","
+                 "\"bid\":1794408135086}",
+                 &event) == BUDDY_EVENT_HEARTBEAT);
+    assert(strcmp(event.heartbeat.build_result, "success") == 0);
+    assert(event.heartbeat.build_id == 1794408135086ULL);
+
+    memset(&event, 0, sizeof(event));
+    assert(parse("{\"page\":\"build\",\"msg\":\"busy\"}", &event) == BUDDY_EVENT_HEARTBEAT);
+    assert(event.heartbeat.build_result[0] == '\0');
+    assert(event.heartbeat.build_id == 0);
+}
+
 int main(void)
 {
+    test_companion_heartbeat_build_result();
     test_official_heartbeat_maps_documented_fields();
     test_heartbeat_optional_prompt_stays_in_heartbeat_snapshot();
     test_unpair_maps_confirmation_event();

@@ -1,8 +1,19 @@
+/*
+ * MacBoard 编译页：
+ *
+ *   上部   纯文本编译日志（黑底、无边框），最新一行在最下面，能放几行放几行。
+ *          heartbeat 只带最近 8 条 entries，这里在本地按重叠合并成更长的滚动历史。
+ *   底部   EVA 控制条 + 音乐页同款居中 PLAY 按钮：OK = 开始编译；编译中置灰。
+ *
+ * 显示时创建、隐藏即销毁：LVGL 内置堆只够一个 EVA 屏常驻。日志历史在静态内存，跨页面保留。
+ */
 #include "buddy_eva_build.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "buddy_macboard.h"
 #include "eva_player_frame.h"
 #include "eva_text_buttons.h"
 #include "lvgl.h"
@@ -10,159 +21,181 @@
 #define COLOR_BG EVA_FRAME_BG
 #define COLOR_ORANGE EVA_FRAME_ORANGE
 #define COLOR_GREEN EVA_FRAME_GREEN
-#define COLOR_MAGENTA EVA_FRAME_MAGENTA
 #define COLOR_RED 0xFF3359U
-#define COLOR_YELLOW 0xFFF14CU
-#define STATUS_Y 104
-#define STATUS_H 22
-#define LOG_Y 130
-#define LOG_BOTTOM 258
-#define LOG_ROW_H 16
+
+/* 日志区：y=4 到控制条 y=258 之间，每行 18px（font_zh_16）。 */
+#define LOG_TOP 4
+#define LOG_LINE_H 18
+#define LOG_ROWS ((EVA_FRAME_CTRL_TOP - LOG_TOP) / LOG_LINE_H)
+#define LOG_X 6
+#define LOG_W 228
+/* PLAY 按钮居中 */
+#define PLAY_X ((240 - EVA_FRAME_BUTTON_W) / 2)
 
 LV_FONT_DECLARE(font_zh_16);
 
 static lv_obj_t *s_scr;
 static lv_obj_t *s_i4_screen;
 static bool s_visible;
-static lv_obj_t *s_battery_image;
-static lv_obj_t *s_buttons[4];
-static lv_obj_t *s_button_icons[4];
-static lv_obj_t *s_status_panel;
-static lv_obj_t *s_status_label;
-static lv_obj_t *s_log_rows[BUDDY_ENTRY_COUNT];
-static lv_obj_t *s_log_labels[BUDDY_ENTRY_COUNT];
 static bool s_built;
-static char s_last_status[BUDDY_MESSAGE_MAX];
-static unsigned s_last_status_color;
-static char s_last_log[BUDDY_ENTRY_COUNT][BUDDY_ENTRY_MAX];
-static int s_battery_bars = -1;
 
-static lv_obj_t *panel(lv_obj_t *parent, int x, int y, int w, int h, uint32_t bg, uint32_t border)
+static lv_obj_t *s_play_button;
+static lv_obj_t *s_play_icon;
+static int s_last_play_enabled = -1;
+
+static lv_obj_t *s_log_labels[LOG_ROWS];
+static char s_last_log[LOG_ROWS][BUDDY_ENTRY_MAX];
+static uint32_t s_last_log_color[LOG_ROWS];
+
+/* 本地日志历史（静态内存，不占 LVGL 堆）。 */
+static char s_history[LOG_ROWS][BUDDY_ENTRY_MAX];
+static int s_history_count;
+
+/* ---------- 文本净化：字体里没有的字形换成 '?'，避免出现豆腐块 ---------- */
+
+static uint32_t utf8_next(const char *s, size_t *i)
 {
-    return eva_player_frame_panel(parent, x, y, w, h, bg, border);
+    const unsigned char *p = (const unsigned char *)s + *i;
+    uint32_t cp;
+    int extra;
+
+    if (p[0] < 0x80) { cp = p[0]; extra = 0; }
+    else if ((p[0] & 0xE0) == 0xC0) { cp = p[0] & 0x1F; extra = 1; }
+    else if ((p[0] & 0xF0) == 0xE0) { cp = p[0] & 0x0F; extra = 2; }
+    else if ((p[0] & 0xF8) == 0xF0) { cp = p[0] & 0x07; extra = 3; }
+    else { (*i)++; return '?'; }
+    for (int k = 1; k <= extra; k++) {
+        if ((p[k] & 0xC0) != 0x80) { *i += (size_t)k; return '?'; }
+        cp = (cp << 6) | (p[k] & 0x3F);
+    }
+    *i += (size_t)extra + 1U;
+    return cp;
 }
 
-static void make_button(lv_obj_t *parent, int index, const lv_image_dsc_t *icon, int x)
+static void sanitize_line(char *dst, size_t size, const char *src)
 {
-    s_buttons[index] = panel(parent, x, 266, 52, 30, COLOR_BG, COLOR_ORANGE);
-    lv_obj_t *img = lv_image_create(s_buttons[index]);
-    lv_image_set_src(img, icon);
-    lv_obj_set_style_image_recolor(img, lv_color_hex(COLOR_ORANGE), 0);
-    lv_obj_set_style_image_recolor_opa(img, LV_OPA_COVER, 0);
-    lv_obj_center(img);
-    s_button_icons[index] = img;
+    size_t i = 0;
+    size_t o = 0;
+    lv_font_glyph_dsc_t dsc;
+
+    while (src[i] != '\0' && o + 1 < size) {
+        size_t start = i;
+        uint32_t cp = utf8_next(src, &i);
+        size_t len = i - start;
+        if (cp == '\t') cp = ' ';
+        if (cp < 0x20 || !lv_font_get_glyph_dsc(&font_zh_16, &dsc, cp, 0)) {
+            dst[o++] = '?';
+            continue;
+        }
+        if (cp < 0x80) {
+            dst[o++] = (char)cp;
+        } else {
+            if (o + len >= size) break;
+            memcpy(dst + o, src + start, len);
+            o += len;
+        }
+    }
+    dst[o] = '\0';
 }
 
-static int battery_bar_count(unsigned percent)
+/* ---------- 日志历史合并 ---------- */
+
+static bool history_matches(int start, const char (*entries)[BUDDY_ENTRY_MAX], int k)
 {
-    if (percent == 0) return 0;
-    if (percent <= 33) return 1;
-    if (percent <= 66) return 2;
-    return 3;
+    for (int j = 0; j < k; j++) {
+        if (strcmp(s_history[start + j], entries[j]) != 0) return false;
+    }
+    return true;
 }
 
-static uint32_t status_color_for(const char *status)
+static void history_push(const char *line)
 {
-    if (status == NULL || status[0] == '\0') {
-        return COLOR_ORANGE;
+    if (s_history_count == LOG_ROWS) {
+        memmove(s_history[0], s_history[1], sizeof(s_history[0]) * (LOG_ROWS - 1));
+        s_history_count--;
     }
-    if (strcmp(status, "busy") == 0 || strcmp(status, "starting") == 0) {
-        return COLOR_YELLOW;
-    }
-    if (strcmp(status, "success") == 0) {
-        return COLOR_GREEN;
-    }
-    if (strcmp(status, "failure") == 0 || strcmp(status, "no-xcode") == 0) {
-        return COLOR_RED;
-    }
-    return COLOR_ORANGE;
+    snprintf(s_history[s_history_count], sizeof(s_history[0]), "%s", line);
+    s_history_count++;
 }
 
-static void update_button_styles(void)
+/* entries = Mac 发来的最近 N 行（时间线滑动窗口 / 失败时的错误行）。
+ * 找历史末尾与 entries 开头的最长重叠，只追加新行；新一轮编译（"00:00 " 开头且无重叠）清空历史。 */
+static void merge_entries(const buddy_ui_snapshot_t *snapshot)
 {
-    for (int i = 0; i < 4; i++) {
-        uint32_t bg = (i == 1) ? COLOR_MAGENTA : COLOR_BG;
-        lv_obj_set_style_bg_color(s_buttons[i], lv_color_hex(bg), 0);
-    }
-}
-
-static void update_status(const buddy_ui_snapshot_t *snapshot)
-{
-    const char *status = snapshot->message[0] ? snapshot->message : "idle";
-    uint32_t color = status_color_for(status);
-
-    if (strcmp(status, s_last_status) != 0) {
-        snprintf(s_last_status, sizeof(s_last_status), "%s", status);
-        lv_label_set_text(s_status_label, status);
-    }
-    if (color != s_last_status_color) {
-        s_last_status_color = color;
-        lv_obj_set_style_bg_color(s_status_panel, lv_color_hex(color), 0);
-        lv_obj_set_style_text_color(s_status_label, lv_color_hex(COLOR_BG), 0);
-    }
-}
-
-static int count_log_lines(const buddy_ui_snapshot_t *snapshot)
-{
+    char clean[BUDDY_ENTRY_COUNT][BUDDY_ENTRY_MAX];
     int n = 0;
+    int overlap = 0;
+
     for (int i = 0; i < BUDDY_ENTRY_COUNT; i++) {
-        if (snapshot->entries[i][0] != '\0') {
-            n++;
-        }
+        if (snapshot->entries[i][0] == '\0') continue;
+        sanitize_line(clean[n], sizeof(clean[n]), snapshot->entries[i]);
+        n++;
     }
-    return n;
-}
+    if (n == 0) return;
 
-static const char *log_line_at(const buddy_ui_snapshot_t *snapshot, int index)
-{
-    int seen = 0;
-    for (int i = 0; i < BUDDY_ENTRY_COUNT; i++) {
-        if (snapshot->entries[i][0] == '\0') {
-            continue;
+    for (int k = (n < s_history_count ? n : s_history_count); k > 0; k--) {
+        if (history_matches(s_history_count - k, (const char (*)[BUDDY_ENTRY_MAX])clean, k)) {
+            overlap = k;
+            break;
         }
-        if (seen == index) {
-            return snapshot->entries[i];
-        }
-        seen++;
     }
-    return NULL;
-}
-
-static void update_log(const buddy_ui_snapshot_t *snapshot, int log_scroll_px)
-{
-    const int visible = (LOG_BOTTOM - LOG_Y) / LOG_ROW_H;
-    int line_count = count_log_lines(snapshot);
-    int first = log_scroll_px / LOG_ROW_H;
-    if (first < 0) {
-        first = 0;
+    if (overlap == 0 && strncmp(clean[0], "00:00 ", 6) == 0) {
+        s_history_count = 0;
     }
-    if (line_count > visible && first > line_count - visible) {
-        first = line_count - visible;
-    }
-
-    for (int row = 0; row < BUDDY_ENTRY_COUNT; row++) {
-        if (row >= visible) {
-            lv_obj_add_flag(s_log_rows[row], LV_OBJ_FLAG_HIDDEN);
-            continue;
-        }
-        lv_obj_remove_flag(s_log_rows[row], LV_OBJ_FLAG_HIDDEN);
-        const char *line = log_line_at(snapshot, first + row);
-        const char *text = (line != NULL && line[0] != '\0') ? line : " ";
-        if (strcmp(text, s_last_log[row]) != 0) {
-            snprintf(s_last_log[row], sizeof(s_last_log[row]), "%s", text);
-            lv_label_set_text(s_log_labels[row], text);
-        }
+    for (int i = overlap; i < n; i++) {
+        history_push(clean[i]);
     }
 }
 
-static void update_battery(const buddy_ui_snapshot_t *snapshot)
+/* ---------- 画面 ---------- */
+
+static void set_row(int row, const char *text, uint32_t color)
 {
-    int bars;
-    if (!s_battery_image) return;
-    bars = snapshot->battery_available ? battery_bar_count(snapshot->battery_percent) : 0;
-    if (bars == s_battery_bars) return;
-    eva_player_frame_battery(s_battery_image, bars);
-    s_battery_bars = bars;
+    if (strcmp(text, s_last_log[row]) != 0) {
+        snprintf(s_last_log[row], sizeof(s_last_log[row]), "%s", text);
+        lv_label_set_text(s_log_labels[row], text);
+    }
+    if (color != s_last_log_color[row]) {
+        s_last_log_color[row] = color;
+        lv_obj_set_style_text_color(s_log_labels[row], lv_color_hex(color), 0);
+    }
+}
+
+static void update_log(const buddy_ui_snapshot_t *snapshot)
+{
+    merge_entries(snapshot);
+
+    if (s_history_count == 0) {
+        /* 还没有日志：最下面一行显示状态 + 提示。 */
+        char placeholder[BUDDY_ENTRY_MAX];
+        const char *status = snapshot->message[0] ? snapshot->message : "idle";
+        size_t i = 0;
+        for (; status[i] != '\0' && i + 12 < sizeof(placeholder); i++) {
+            placeholder[i] = (char)toupper((unsigned char)status[i]);
+        }
+        snprintf(placeholder + i, sizeof(placeholder) - i, "  OK:PLAY");
+        for (int row = 0; row < LOG_ROWS; row++) {
+            set_row(row, row == LOG_ROWS - 1 ? placeholder : "", COLOR_ORANGE);
+        }
+        return;
+    }
+
+    /* 底部对齐：最新一行在最下面。 */
+    for (int row = 0; row < LOG_ROWS; row++) {
+        int idx = s_history_count - LOG_ROWS + row;
+        const char *line = idx >= 0 ? s_history[idx] : "";
+        uint32_t color = strstr(line, "error") != NULL ? COLOR_RED : COLOR_ORANGE;
+        set_row(row, line, color);
+    }
+}
+
+static void update_play_button(const buddy_ui_snapshot_t *snapshot)
+{
+    int enabled = buddy_macboard_build_phase(snapshot->message) == BUDDY_BUILD_PHASE_ACTIVE ? 0 : 1;
+    if (enabled == s_last_play_enabled) return;
+    s_last_play_enabled = enabled;
+    /* 与音乐页焦点按钮同款：可按 = 品红底；编译中 = 黑底暗绿（不可按）。 */
+    eva_player_frame_button_style(s_play_button, s_play_icon, true, enabled != 0);
 }
 
 static void build_screen(void)
@@ -177,46 +210,44 @@ static void build_screen(void)
     lv_obj_set_style_border_width(s_scr, 0, 0);
     lv_obj_set_style_pad_all(s_scr, 0, 0);
 
-    s_battery_image = eva_player_frame_header(s_scr, "BUILD", &font_zh_16);
-
-    s_status_panel = panel(s_scr, 4, STATUS_Y, 232, STATUS_H, COLOR_ORANGE, COLOR_ORANGE);
-    s_status_label = lv_label_create(s_status_panel);
-    lv_obj_set_width(s_status_label, 220);
-    lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_CLIP);
-    lv_obj_set_style_text_color(s_status_label, lv_color_hex(COLOR_BG), 0);
-    lv_obj_set_style_text_font(s_status_label, &font_zh_16, 0);
-    lv_label_set_text(s_status_label, "idle");
-    lv_obj_center(s_status_label);
-
-    for (int i = 0; i < BUDDY_ENTRY_COUNT; i++) {
-        int y = LOG_Y + i * LOG_ROW_H;
-        if (y + LOG_ROW_H > LOG_BOTTOM) {
-            break;
-        }
-        s_log_rows[i] = panel(s_scr, 6, y, 228, LOG_ROW_H - 1, COLOR_BG, COLOR_ORANGE);
-        lv_obj_t *lab = lv_label_create(s_log_rows[i]);
-        s_log_labels[i] = lab;
-        lv_obj_set_width(lab, 214);
+    /* 纯文本行：label 直接挂在屏幕上，无面板 / 边框 / 底色。 */
+    for (int i = 0; i < LOG_ROWS; i++) {
+        lv_obj_t *lab = lv_label_create(s_scr);
+        lv_obj_set_pos(lab, LOG_X, LOG_TOP + i * LOG_LINE_H);
+        lv_obj_set_width(lab, LOG_W);
         lv_label_set_long_mode(lab, LV_LABEL_LONG_CLIP);
         lv_obj_set_style_text_color(lab, lv_color_hex(COLOR_ORANGE), 0);
         lv_obj_set_style_text_font(lab, &font_zh_16, 0);
-        lv_label_set_text(lab, " ");
-        lv_obj_center(lab);
+        lv_label_set_text(lab, "");
+        s_log_labels[i] = lab;
+        s_last_log[i][0] = '\0';
+        s_last_log_color[i] = COLOR_ORANGE;
     }
 
-    panel(s_scr, 3, 258, 234, 45, COLOR_GREEN, COLOR_ORANGE);
-    make_button(s_scr, 0, &eva_text_btn_prev, 5);
-    make_button(s_scr, 1, &eva_text_btn_play, 64);
-    make_button(s_scr, 2, &eva_text_btn_next, 123);
-    make_button(s_scr, 3, &eva_text_btn_menu, 182);
-    panel(s_scr, 3, 313, 234, 2, COLOR_GREEN, COLOR_GREEN);
+    /* 控制条：音乐页同款 PLAY 按钮 */
+    eva_player_frame_control_bar(s_scr);
+    s_play_button = eva_player_frame_button(s_scr, PLAY_X, &eva_text_btn_play, &s_play_icon);
+    eva_player_frame_panel(s_scr, 3, 313, 234, 2, COLOR_GREEN, COLOR_GREEN);
 
     s_built = true;
 }
 
+static void destroy_screen(void)
+{
+    if (!s_built) return;
+    lv_obj_delete(s_scr);
+    s_scr = NULL;
+    s_play_button = NULL;
+    s_play_icon = NULL;
+    s_last_play_enabled = -1;
+    memset(s_log_labels, 0, sizeof(s_log_labels));
+    memset(s_last_log, 0, sizeof(s_last_log));
+    s_built = false;
+}
+
 void buddy_eva_build_init(void)
 {
-    build_screen();
+    /* 按需创建：真正显示时才 build_screen()。 */
 }
 
 bool buddy_eva_build_active(void)
@@ -231,32 +262,28 @@ void buddy_eva_build_register_i4_screen(lv_obj_t *screen)
 
 void buddy_eva_build_set_visible(bool visible)
 {
-    if (!s_built) {
-        buddy_eva_build_init();
-    }
     if (visible == s_visible) {
         return;
     }
     s_visible = visible;
     if (visible) {
+        build_screen();
         lv_screen_load(s_scr);
-        memset(s_last_log, 0, sizeof(s_last_log));
-        s_last_status[0] = '\0';
-        lv_obj_invalidate(s_scr);
+        eva_player_frame_log_mem("build shown");
+    } else {
+        if (s_i4_screen) {
+            lv_screen_load(s_i4_screen);
+        }
+        destroy_screen();
     }
 }
 
-void buddy_eva_build_update(const buddy_ui_snapshot_t *snapshot, int log_scroll_px)
+void buddy_eva_build_update(const buddy_ui_snapshot_t *snapshot, uint64_t elapsed_ms)
 {
-    if (!s_built) {
-        buddy_eva_build_init();
-    }
-    if (!snapshot || !s_visible) {
+    (void)elapsed_ms;
+    if (!snapshot || !s_visible || !s_built) {
         return;
     }
-
-    update_status(snapshot);
-    update_log(snapshot, log_scroll_px);
-    update_battery(snapshot);
-    update_button_styles();
+    update_log(snapshot);
+    update_play_button(snapshot);
 }
