@@ -1,0 +1,33 @@
+name: MacBoard
+options:
+  bundleIdPrefix: com.easyulife
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+packages:
+  MacBoardCore:
+    path: Packages/MacBoardCore
+targets:
+  MacBoard:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/MacBoardApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.easyulife.MacBoard
+        PRODUCT_NAME: MacBoard
+        INFOPLIST_FILE: Sources/MacBoardApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/MacBoardApp/MacBoard.entitlements
+        GENERATE_INFOPLIST_FILE: false
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+        ENABLE_HARDENED_RUNTIME: true
+    dependencies:
+      - package: MacBoardCore
+        product: MacBoardCore
+    scheme:
+      testTargets: []
