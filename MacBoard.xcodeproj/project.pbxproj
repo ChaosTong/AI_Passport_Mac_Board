@@ -10,10 +10,12 @@
 		2A1D49E465B5F97F83E672F5 /* MacBoardApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8506D5DFC5CFFCE9D37E827 /* MacBoardApp.swift */; };
 		4A3B0633B829D2233A115A36 /* MacBoardCore in Frameworks */ = {isa = PBXBuildFile; productRef = EC9B5AB1A1718D0364DA9CA0 /* MacBoardCore */; };
 		E0E03B6A84C526CAB2E20953 /* MenuContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 047333012F63578864148B6B /* MenuContentView.swift */; };
+		F8C3A2B1D4E5078960A1BC2E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A7E9D0C4B5F6128037DE491F /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		047333012F63578864148B6B /* MenuContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuContentView.swift; sourceTree = "<group>"; };
+		A7E9D0C4B5F6128037DE491F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		07376547C4F603BA3F7DAF17 /* MacBoard.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacBoard.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		2BB852DEFD6321DAFB8C2C89 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		2DB73869367E8341D5A4608D /* MacBoardCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MacBoardCore; path = Packages/MacBoardCore; sourceTree = SOURCE_ROOT; };
@@ -36,6 +38,7 @@
 		087CB16699717632BEC9D3E7 /* MacBoardApp */ = {
 			isa = PBXGroup;
 			children = (
+				A7E9D0C4B5F6128037DE491F /* Assets.xcassets */,
 				2BB852DEFD6321DAFB8C2C89 /* Info.plist */,
 				9D7F6C00576A0E2AE5E0EB43 /* MacBoard.entitlements */,
 				B8506D5DFC5CFFCE9D37E827 /* MacBoardApp.swift */,
@@ -85,6 +88,7 @@
 			buildConfigurationList = D622EE77E22BDE4B8DE99BC7 /* Build configuration list for PBXNativeTarget "MacBoard" */;
 			buildPhases = (
 				CBF95745BFD64C7424E19966 /* Sources */,
+				D9B4F6E2A8305C1D4E7F8A3B /* Resources */,
 				F1D42D4C90604B1A998619A4 /* Frameworks */,
 			);
 			buildRules = (
@@ -141,6 +145,17 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXResourcesBuildPhase section */
+		D9B4F6E2A8305C1D4E7F8A3B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F8C3A2B1D4E5078960A1BC2E /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
 		133D3DEF4F7FDD190FF47E64 /* Release */ = {

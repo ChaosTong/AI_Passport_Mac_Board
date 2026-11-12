@@ -358,6 +358,7 @@ public final class MacBoardBridge: NSObject, ObservableObject {
     // MARK: - Birkin 进度文件
 
     private func startProgressFileWatcher() {
+        HammerspoonBuildService.ensureProgressFileExists()
         let dir = birkinProgressFileURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let fd = open(dir.path, O_EVTONLY)
@@ -401,9 +402,12 @@ public final class MacBoardBridge: NSObject, ObservableObject {
 
     private func startProgressPolling() {
         guard progressPollTimer == nil else { return }
-        progressPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        // common modes：菜单栏跟踪 / 滚动时 default mode 定时器可能停，过程行就会被跳过。
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.ingestProgressFile(live: true) }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        progressPollTimer = timer
     }
 
     private func stopProgressPolling() {
@@ -415,6 +419,9 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         buildStartedAt != nil && buildFinishedAt == nil
     }
 
+    /// 板子按了 STOP：忽略随后迟到的 busy 文案，等到 hidden/idle 或 watchdog 再收尾。
+    private var stopRequested = false
+
     /// 处理一条 Birkin 文案：按 state 推进编译状态，文案追加到时间线，并推给板子。
     private func handleBirkinLine(_ line: BirkinProgressLine, live: Bool) {
         if line.seq > 0 {
@@ -424,6 +431,13 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         }
         switch line.state {
         case "busy":
+            if stopRequested, isTrackingBuild {
+                break
+            }
+            if stopRequested {
+                // 已经开了新一轮（例如 STOP 后立刻 PLAY），不要丢掉过程行
+                stopRequested = false
+            }
             if !isTrackingBuild {
                 // 外部触发（Xcode ⌘B / ⌥R）：开新时间线
                 buildErrorLines = []
@@ -442,12 +456,19 @@ public final class MacBoardBridge: NSObject, ObservableObject {
             }
         case "idle":
             appendBirkinText(line.text, throttle: false)
-            if buildStatus.isBuilding { finishBuild(.idle, note: line.text.isEmpty) }
+            if buildStatus.isBuilding || stopRequested {
+                finishBuild(.idle, note: line.text.isEmpty)
+            }
+            stopRequested = false
         case "hidden":
-            // 菜单栏被收起：编译中（非刚按下 PLAY 的 starting）即视为取消
-            if buildStatus == .busy {
-                appendBuildProcess("canceled")
-                finishBuild(.idle, note: false)
+            // 菜单栏被收起：编译中（非刚按下 PLAY 的 starting）即视为取消。
+            // 若板子刚发了 STOP，starting 阶段的 hidden 也算取消。
+            if stopRequested || buildStatus == .busy {
+                if isTrackingBuild || buildStatus.isBuilding {
+                    appendBuildProcess("canceled")
+                    finishBuild(.idle, note: false)
+                }
+                stopRequested = false
             }
         default:
             appendBirkinText(line.text, throttle: false)
@@ -481,6 +502,7 @@ public final class MacBoardBridge: NSObject, ObservableObject {
 
     private func finishBuild(_ status: BirkinBuildStatus, note: Bool) {
         buildStatus = status
+        stopRequested = false
         stopBuildWatchdog()
         if isTrackingBuild {
             buildFinishedAt = Date()
@@ -654,36 +676,23 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         }
     }
 
-    /// 连接就绪时一次性同步编译状态；若正在编译，用 birkinProgressLines 补齐本轮已显示的文案。
+    /// 连接就绪时同步编译状态。以进度文件为准，不要用可能过期的 birkinStatus()
+    /// 把 birkinSeq 往前跳、丢掉还没入库的过程行，也不要覆盖正在跟踪的时间线。
     private func refreshBuildSnapshot() async {
-        let status = await buildService.status()
-        if status == .failure {
-            buildErrorLines = await buildService.errorLines()
-        } else if status == .success {
-            buildErrorLines = []
-        }
-        if status.isBuilding, !isTrackingBuild {
-            beginBuildTimeline(note: status.rawValue)
-            if let catchUp = HammerspoonBuildService.readProgressFile(since: 0).value {
-                let tail = catchUp.lines.reversed().prefix { $0.state == "busy" || $0.state == "info" }
-                for line in tail.reversed() {
-                    handleBirkinLine(line, live: false)
-                }
-                birkinSeq = catchUp.latestSeq
-            } else if let catchUp = await buildService.progressLines(since: 0) {
-                let tail = catchUp.lines.reversed().prefix { $0.state == "busy" || $0.state == "info" }
-                for line in tail.reversed() {
-                    handleBirkinLine(line, live: false)
-                }
-                birkinSeq = catchUp.latestSeq
+        ingestProgressFile(live: false)
+        if !isTrackingBuild {
+            let status = await buildService.status()
+            if status == .failure {
+                buildErrorLines = await buildService.errorLines()
+            } else if status == .success {
+                buildErrorLines = []
             }
-            armBuildWatchdog()
-        } else if let catchUp = HammerspoonBuildService.readProgressFile(since: 0).value {
-            birkinSeq = catchUp.latestSeq
-        } else if let catchUp = await buildService.progressLines(since: 0) {
-            birkinSeq = catchUp.latestSeq
+            if status.isBuilding {
+                beginBuildTimeline(note: status.rawValue)
+                ingestProgressFile(live: false)
+                armBuildWatchdog()
+            }
         }
-        buildStatus = status.isBuilding ? .busy : status
         if phase == .ready {
             if activePage == .build {
                 pushCurrentHeartbeat()
@@ -694,10 +703,13 @@ public final class MacBoardBridge: NSObject, ObservableObject {
     }
 
     private func beginBuildTimeline(note: String?) {
+        stopRequested = false
         buildStartedAt = Date()
         buildFinishedAt = nil
         buildProcessLines = []
         lastBuildProgress = nil
+        lastBuildProgressShape = nil
+        lastBuildProgressAt = nil
         startProgressPolling()
         if let note {
             appendBuildProcess(note)
@@ -822,9 +834,15 @@ public final class MacBoardBridge: NSObject, ObservableObject {
             // 正在编译：不重复 ⌘B（板子侧也会在编译中屏蔽 PLAY）
             appendLog("birkinBuild 跳过：编译进行中")
             sendAck(.build, ok: false, error: "busy")
-            pushCurrentHeartbeat()
+            pushBuildHeartbeat()
             return
         }
+        // 先开时间线再等 birkinBuild()：hs 调用期间文件里可能已经写入过程行，
+        // 结束后再 begin 会清空这些行，且 birkinSeq 已前进，过程就只剩开始和成功。
+        beginBuildTimeline(note: fromBoard ? "PLAY: birkinBuild()" : "birkinBuild()")
+        buildStatus = .starting
+        buildErrorLines = []
+        armBuildWatchdog()
         let result = await buildService.triggerBuild()
         appendLog("birkinBuild → \(result)")
         let lowered = result.lowercased()
@@ -835,16 +853,35 @@ public final class MacBoardBridge: NSObject, ObservableObject {
             buildStartedAt = nil
             buildFinishedAt = nil
             buildProcessLines = ["00:00 Xcode not running"]
-            pushCurrentHeartbeat()
+            pushBuildHeartbeat()
             return
         }
-        beginBuildTimeline(note: fromBoard ? "PLAY: birkinBuild()" : "birkinBuild()")
-        buildStatus = .starting
-        buildErrorLines = []
         // 不切板子页面：编译结果 bres/bid 随任何页的 heartbeat 下发，提示音照样响
         sendAck(.build, ok: true, error: nil)
-        pushCurrentHeartbeat()
-        // 之后的进度从 Birkin 进度文件读；只留 30s 兜底核对
+        pushBuildHeartbeat()
+        ingestProgressFile(live: true)
+    }
+
+    private func handleBuildStop() async {
+        if !buildStatus.isBuilding {
+            appendLog("birkinStop 跳过：当前没有在编译")
+            sendAck(.build, ok: false, error: "idle")
+            pushBuildHeartbeat()
+            return
+        }
+        stopRequested = true
+        appendBuildProcess("STOP")
+        let result = await buildService.stopBuild()
+        appendLog("birkinStop → \(result)")
+        let lowered = result.lowercased()
+        if lowered.contains("no-xcode") || lowered.contains("no-stop") {
+            stopRequested = false
+            sendAck(.build, ok: false, error: lowered.contains("no-stop") ? "no-stop" : "no-xcode")
+            pushBuildHeartbeat()
+            return
+        }
+        sendAck(.build, ok: true, error: nil)
+        pushBuildHeartbeat()
         armBuildWatchdog()
     }
 
@@ -896,6 +933,8 @@ public final class MacBoardBridge: NSObject, ObservableObject {
                 let action = jsonString(payload["action"]) ?? ""
                 if action == "start" {
                     Task { await handleBuildStart(fromBoard: true) }
+                } else if action == "stop" {
+                    Task { await handleBuildStop() }
                 }
             case "page":
                 // 板子长按 DOWN 切页 / 收到别的页的数据时上报当前页：Mac 跟随并推这一页的数据

@@ -50,6 +50,15 @@ lv_obj_t *eva_player_frame_header(lv_obj_t *parent, const char *mode, const lv_f
     return battery_image;
 }
 
+lv_obj_t *eva_player_frame_battery_create(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    lv_obj_t *slot = eva_player_frame_panel(parent, x, y, w, h, EVA_FRAME_BG, EVA_FRAME_ORANGE);
+    lv_obj_t *battery_image = lv_image_create(slot);
+    lv_image_set_src(battery_image, &eva_text_internal_battery_0);
+    lv_obj_center(battery_image);
+    return battery_image;
+}
+
 void eva_player_frame_battery(lv_obj_t *image, int bars)
 {
     static const lv_image_dsc_t *const images[] = {
@@ -62,7 +71,7 @@ void eva_player_frame_battery(lv_obj_t *image, int bars)
 
 void eva_player_frame_control_bar(lv_obj_t *parent)
 {
-    eva_player_frame_panel(parent, 3, EVA_FRAME_CTRL_TOP, 234, 45, EVA_FRAME_GREEN, EVA_FRAME_ORANGE);
+    eva_player_frame_panel(parent, 3, EVA_FRAME_CTRL_TOP, 234, EVA_FRAME_CTRL_H, EVA_FRAME_GREEN, EVA_FRAME_ORANGE);
 }
 
 lv_obj_t *eva_player_frame_button(lv_obj_t *parent, int x, const lv_image_dsc_t *icon,

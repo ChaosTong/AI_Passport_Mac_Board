@@ -7,3 +7,4 @@ extern const lv_image_dsc_t eva_text_btn_play;
 extern const lv_image_dsc_t eva_text_btn_next;
 extern const lv_image_dsc_t eva_text_btn_menu;
 extern const lv_image_dsc_t eva_text_btn_pause;
+extern const lv_image_dsc_t eva_text_btn_stop;

@@ -970,6 +970,19 @@ static void test_macboard_build_ok_starts_once_while_running(void)
     assert(strcmp(action.macboard_cmd, "build") == 0);
     assert(strcmp(action.macboard_action, "start") == 0);
 
+    /* 空闲时 STOP 不可用。 */
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_DOWN, &action));
+    assert(state.build_control_focus == 1U);
+    assert(action.type == BUDDY_ACTION_NONE);
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_OK, &action));
+    assert(action.type == BUDDY_ACTION_NONE);
+
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_UP, &action));
+    assert(state.build_control_focus == 0U);
+
     /* Mac 报告编译中：PLAY 置灰，OK 被吞掉不再上行。 */
     snprintf(state.message, sizeof(state.message), "busy");
     state.running = 1U;
@@ -978,11 +991,22 @@ static void test_macboard_build_ok_starts_once_while_running(void)
     assert(buddy_macboard_handle_key(&state, BUDDY_KEY_OK, &action));
     assert(action.type == BUDDY_ACTION_NONE);
 
-    /* 心跳过期：允许重新触发，避免卡死在 busy。 */
+    /* 编译中切到 STOP：上行 build stop。 */
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_DOWN, &action));
+    memset(&action, 0, sizeof(action));
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_OK, &action));
+    assert(action.type == BUDDY_ACTION_MACBOARD_UPLINK);
+    assert(strcmp(action.macboard_cmd, "build") == 0);
+    assert(strcmp(action.macboard_action, "stop") == 0);
+
+    /* 心跳过期：PLAY 允许重新触发，避免卡死在 busy。 */
+    assert(buddy_macboard_handle_key(&state, BUDDY_KEY_UP, &action));
     state.heartbeat_stale = true;
     memset(&action, 0, sizeof(action));
     assert(buddy_macboard_handle_key(&state, BUDDY_KEY_OK, &action));
     assert(action.type == BUDDY_ACTION_MACBOARD_UPLINK);
+    assert(strcmp(action.macboard_action, "start") == 0);
 
     /* 编译结束：再次可按。 */
     state.heartbeat_stale = false;

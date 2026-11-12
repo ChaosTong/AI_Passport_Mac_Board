@@ -807,6 +807,7 @@ void buddy_state_snapshot(const buddy_state_t *state, buddy_ui_snapshot_t *snaps
     snapshot->battery_mv = state->battery_mv;
     snapshot->macboard_companion = state->macboard_companion;
     snapshot->music_control_focus = state->music_control_focus;
+    snapshot->build_control_focus = state->build_control_focus;
     snapshot->music_playlist_open = state->music_playlist_open;
     snapshot->music_playlist_pick = state->music_playlist_pick;
     snapshot->music_playlist_window = state->music_playlist_window;

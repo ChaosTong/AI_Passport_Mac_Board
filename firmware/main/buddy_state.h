@@ -61,6 +61,8 @@ typedef struct {
     bool music_ui_playing;
     /** 0–3：PREV / PLAY / NEXT / MENU，UP/DOWN 移动，OK 确认。 */
     uint8_t music_control_focus;
+    /** 编译页：0 = PLAY，1 = STOP；UP/DOWN 切换，OK 确认。 */
+    uint8_t build_control_focus;
     bool music_playlist_open;
     uint16_t music_playlist_pick;
     uint16_t music_playlist_window;

@@ -323,6 +323,8 @@ typedef struct {
     bool macboard_companion;
     /** Music UI: 0–3 = PREV/PLAY/NEXT/MENU 当前选中（洋红）。 */
     uint8_t music_control_focus;
+    /** 编译页：0 = PLAY，1 = STOP。 */
+    uint8_t build_control_focus;
     bool music_playlist_open;
     uint16_t music_playlist_pick;
     uint16_t music_playlist_window;

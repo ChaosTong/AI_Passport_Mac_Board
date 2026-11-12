@@ -262,20 +262,30 @@ bool buddy_macboard_handle_key(buddy_state_t *state, buddy_key_t key, buddy_acti
         return false;
     }
     if (state->page == BUDDY_PAGE_BUILD) {
+        if (key == BUDDY_KEY_UP) {
+            state->build_control_focus = 0U;
+            return true;
+        }
+        if (key == BUDDY_KEY_DOWN) {
+            state->build_control_focus = 1U;
+            return true;
+        }
         if (key == BUDDY_KEY_OK) {
-            /* OK = EVA PLAY 按钮。编译进行中（且 Mac 心跳未过期）不重复触发 ⌘B。 */
-            if (state->running != 0U && !state->heartbeat_stale &&
-                buddy_macboard_build_phase(state->message) == BUDDY_BUILD_PHASE_ACTIVE) {
+            bool active = state->running != 0U && !state->heartbeat_stale &&
+                buddy_macboard_build_phase(state->message) == BUDDY_BUILD_PHASE_ACTIVE;
+            if (state->build_control_focus == 1U) {
+                /* STOP：仅在编译进行中（心跳未过期）上行停止。 */
+                if (!active) {
+                    return true;
+                }
+                buddy_macboard_queue_uplink(action, "build", "stop");
+                return true;
+            }
+            /* PLAY：编译进行中不重复触发。 */
+            if (active) {
                 return true;
             }
             buddy_macboard_queue_uplink(action, "build", "start");
-            return true;
-        }
-        if (key == BUDDY_KEY_UP || key == BUDDY_KEY_DOWN) {
-            if (action != NULL) {
-                action->type = BUDDY_ACTION_UI_SCROLL;
-                action->scroll_delta = key == BUDDY_KEY_DOWN ? 24 : -24;
-            }
             return true;
         }
     } else {

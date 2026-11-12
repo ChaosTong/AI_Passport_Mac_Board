@@ -3,7 +3,8 @@
  *
  *   上部   纯文本编译日志（黑底、无边框），最新一行在最下面，能放几行放几行。
  *          heartbeat 只带最近 8 条 entries，这里在本地按重叠合并成更长的滚动历史。
- *   底部   EVA 控制条 + 音乐页同款居中 PLAY 按钮：OK = 开始编译；编译中置灰。
+ *   底部   EVA 控制条：左侧 PLAY（开始编译）和 STOP（停止运行），右侧电量保持不动。
+ *          UP/DOWN 在两个按钮间切换，OK 确认；编译中 PLAY 置灰，空闲时 STOP 置灰。
  *
  * 显示时创建、隐藏即销毁：LVGL 内置堆只够一个 EVA 屏常驻。日志历史在静态内存，跨页面保留。
  */
@@ -29,8 +30,11 @@
 #define LOG_ROWS ((EVA_FRAME_CTRL_TOP - LOG_TOP) / LOG_LINE_H)
 #define LOG_X 6
 #define LOG_W 228
-/* PLAY 按钮居中 */
-#define PLAY_X ((240 - EVA_FRAME_BUTTON_W) / 2)
+/* PLAY / STOP 靠左（与音乐页前两颗按钮同位置），电量仍贴在控制条右侧。 */
+#define PLAY_X 5
+#define STOP_X 64
+#define BATT_X 146
+#define BATT_W ((3 + 234) - BATT_X)
 
 LV_FONT_DECLARE(font_zh_16);
 
@@ -41,7 +45,14 @@ static bool s_built;
 
 static lv_obj_t *s_play_button;
 static lv_obj_t *s_play_icon;
+static lv_obj_t *s_stop_button;
+static lv_obj_t *s_stop_icon;
 static int s_last_play_enabled = -1;
+static int s_last_stop_enabled = -1;
+static int s_last_focus = -1;
+
+static lv_obj_t *s_battery_image;
+static int s_battery_bars = -1;
 
 static lv_obj_t *s_log_labels[LOG_ROWS];
 static char s_last_log[LOG_ROWS][BUDDY_ENTRY_MAX];
@@ -181,7 +192,7 @@ static void update_log(const buddy_ui_snapshot_t *snapshot)
         for (; status[i] != '\0' && i + 12 < sizeof(placeholder); i++) {
             placeholder[i] = (char)toupper((unsigned char)status[i]);
         }
-        snprintf(placeholder + i, sizeof(placeholder) - i, "  OK:PLAY");
+        snprintf(placeholder + i, sizeof(placeholder) - i, "  OK:PLAY/STOP");
         for (int row = 0; row < LOG_ROWS; row++) {
             set_row(row, row == LOG_ROWS - 1 ? placeholder : "", COLOR_ORANGE);
         }
@@ -197,13 +208,41 @@ static void update_log(const buddy_ui_snapshot_t *snapshot)
     }
 }
 
-static void update_play_button(const buddy_ui_snapshot_t *snapshot)
+static void update_battery(const buddy_ui_snapshot_t *snapshot)
 {
-    int enabled = buddy_macboard_build_phase(snapshot->message) == BUDDY_BUILD_PHASE_ACTIVE ? 0 : 1;
-    if (enabled == s_last_play_enabled) return;
-    s_last_play_enabled = enabled;
-    /* 与音乐页焦点按钮同款：可按 = 品红底；编译中 = 黑底暗绿（不可按）。 */
-    eva_player_frame_button_style(s_play_button, s_play_icon, true, enabled != 0);
+    int bars;
+
+    if (!s_battery_image) {
+        return;
+    }
+    bars = snapshot->battery_available
+        ? eva_player_frame_battery_bars(snapshot->battery_percent)
+        : 0;
+    if (bars == s_battery_bars) {
+        return;
+    }
+    eva_player_frame_battery(s_battery_image, bars);
+    s_battery_bars = bars;
+}
+
+static void update_control_buttons(const buddy_ui_snapshot_t *snapshot)
+{
+    int building = buddy_macboard_build_phase(snapshot->message) == BUDDY_BUILD_PHASE_ACTIVE ? 1 : 0;
+    int focus = snapshot->build_control_focus == 1U ? 1 : 0;
+    int play_enabled = building ? 0 : 1;
+    int stop_enabled = building ? 1 : 0;
+
+    if (play_enabled == s_last_play_enabled &&
+        stop_enabled == s_last_stop_enabled &&
+        focus == s_last_focus) {
+        return;
+    }
+    s_last_play_enabled = play_enabled;
+    s_last_stop_enabled = stop_enabled;
+    s_last_focus = focus;
+    /* 与音乐页同款：焦点且可按 = 品红底；不可按 = 黑底暗绿。 */
+    eva_player_frame_button_style(s_play_button, s_play_icon, focus == 0, play_enabled != 0);
+    eva_player_frame_button_style(s_stop_button, s_stop_icon, focus == 1, stop_enabled != 0);
 }
 
 static void build_screen(void)
@@ -232,9 +271,16 @@ static void build_screen(void)
         s_last_log_color[i] = COLOR_ORANGE;
     }
 
-    /* 控制条：音乐页同款 PLAY 按钮 */
+    /* 控制条：PLAY + STOP 靠左，电量仍在右侧原位。 */
     eva_player_frame_control_bar(s_scr);
     s_play_button = eva_player_frame_button(s_scr, PLAY_X, &eva_text_btn_play, &s_play_icon);
+    s_stop_button = eva_player_frame_button(s_scr, STOP_X, &eva_text_btn_stop, &s_stop_icon);
+    s_battery_image = eva_player_frame_battery_create(
+        s_scr,
+        BATT_X,
+        EVA_FRAME_CTRL_TOP,
+        BATT_W,
+        EVA_FRAME_CTRL_H);
     eva_player_frame_panel(s_scr, 3, 313, 234, 2, COLOR_GREEN, COLOR_GREEN);
 
     s_built = true;
@@ -247,7 +293,13 @@ static void destroy_screen(void)
     s_scr = NULL;
     s_play_button = NULL;
     s_play_icon = NULL;
+    s_stop_button = NULL;
+    s_stop_icon = NULL;
     s_last_play_enabled = -1;
+    s_last_stop_enabled = -1;
+    s_last_focus = -1;
+    s_battery_image = NULL;
+    s_battery_bars = -1;
     memset(s_log_labels, 0, sizeof(s_log_labels));
     memset(s_last_log, 0, sizeof(s_last_log));
     s_built = false;
@@ -293,5 +345,6 @@ void buddy_eva_build_update(const buddy_ui_snapshot_t *snapshot, uint64_t elapse
         return;
     }
     update_log(snapshot);
-    update_play_button(snapshot);
+    update_control_buttons(snapshot);
+    update_battery(snapshot);
 }

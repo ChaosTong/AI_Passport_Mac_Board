@@ -71,6 +71,12 @@ public struct HammerspoonBuildService: Sendable {
         await runLuaExpression("birkinBuild()")
     }
 
+    public func stopBuild() async -> String {
+        await runLuaExpression(
+            "(type(birkinStop) == 'function' and birkinStop()) or 'no-stop'"
+        )
+    }
+
     public func status() async -> BirkinBuildStatus {
         BirkinBuildStatus(wire: await runLuaExpression("birkinStatus()"))
     }
@@ -125,8 +131,32 @@ public struct HammerspoonBuildService: Sendable {
             }
             return ProgressFileRead(value: (latest, lines, file.state == "hidden"), error: nil)
         } catch {
+            if isMissingProgressFile(error) {
+                return ProgressFileRead(value: nil, error: nil)
+            }
             return ProgressFileRead(value: nil, error: error.localizedDescription)
         }
+    }
+
+    /// Hammerspoon 原子写进度时可能短暂不可读；不当成硬错误。
+    private static func isMissingProgressFile(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileReadNoSuchFileError { return true }
+        if ns.domain == NSPOSIXErrorDomain, ns.code == ENOENT { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isMissingProgressFile(underlying)
+        }
+        return false
+    }
+
+    /// 与 init.lua 空快照一致，避免 Mac 先启动时一直报「文件不存在」。
+    public static func ensureProgressFileExists() {
+        let url = birkinProgressFileURL
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        let stub = Data("{\"seq\":0,\"state\":\"idle\",\"text\":\"\",\"items\":[]}".utf8)
+        try? stub.write(to: url, options: .atomic)
     }
 
     static func cleanProgress(_ text: String) -> String? {
@@ -146,6 +176,9 @@ public struct HammerspoonBuildService: Sendable {
         if line == "nil" || line.isEmpty { return nil }
         // 板子字体只有 ASCII + 常用汉字：把 Xcode 的分隔符换成 ASCII。
         line = line
+            .replacingOccurrences(of: "\u{2009}", with: " ")
+            .replacingOccurrences(of: "\u{202F}", with: " ")
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
             .replacingOccurrences(of: "•", with: "-")
             .replacingOccurrences(of: "│", with: "|")
             .replacingOccurrences(of: "·", with: "-")

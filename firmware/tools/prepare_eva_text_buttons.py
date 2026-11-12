@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""EVA player control labels (PREV/PLAY/NEXT/PAUSE) — same font as header assets."""
+"""EVA player control labels (PREV/PLAY/NEXT/PAUSE/STOP) — same font as header assets."""
 import argparse
 import os
 from pathlib import Path
@@ -93,6 +93,7 @@ def main():
         ("eva_text_btn_next", "NEXT", args.font_size),
         ("eva_text_btn_menu", "MENU", args.font_size),
         ("eva_text_btn_pause", "PAUSE", args.font_size),
+        ("eva_text_btn_stop", "STOP", args.font_size),
     ]
 
     source, descriptors = build_source(labels)
