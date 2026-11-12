@@ -243,9 +243,30 @@ static void test_sound_command_queues_preview_and_acks(void)
     assert(strcmp(fake.sent, "{\"ack\":\"sound\",\"ok\":false,\"error\":\"unknown sound\"}\n") == 0);
 }
 
+
+static void test_page_uplink_is_sent(void)
+{
+    fake_runtime_t fake = { .secure = true };
+    buddy_orchestrator_ops_t ops = fake_ops(&fake);
+    buddy_state_t state;
+    buddy_action_t action;
+
+    memset(&fake, 0, sizeof(fake));
+    fake.secure = true;
+    buddy_state_init(&state, NULL);
+    state.ble_connection_generation = 7U;
+    memset(&action, 0, sizeof(action));
+    action.type = BUDDY_ACTION_MACBOARD_UPLINK;
+    snprintf(action.macboard_cmd, sizeof(action.macboard_cmd), "%s", "page");
+    snprintf(action.macboard_action, sizeof(action.macboard_action), "%s", "build");
+    assert(buddy_orchestrator_execute_action(&state, &ops, &action, NULL));
+    assert(strcmp(fake.sent, "{\"cmd\":\"page\",\"action\":\"build\"}\n") == 0);
+}
+
 int main(void)
 {
     test_sound_command_queues_preview_and_acks();
+    test_page_uplink_is_sent();
     test_official_rx_fixtures_reach_state_and_responses();
     test_failed_setting_commit_sends_error_ack_without_state_change();
     test_executor_orders_sensitive_side_effects();

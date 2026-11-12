@@ -168,7 +168,15 @@ static void update_log(const buddy_ui_snapshot_t *snapshot)
     if (s_history_count == 0) {
         /* 还没有日志：最下面一行显示状态 + 提示。 */
         char placeholder[BUDDY_ENTRY_MAX];
-        const char *status = snapshot->message[0] ? snapshot->message : "idle";
+        const char *status = snapshot->message;
+        if (buddy_macboard_build_phase(status) == BUDDY_BUILD_PHASE_IDLE &&
+            (status == NULL || strcmp(status, "idle") != 0)) {
+            /* 刚从音乐页切过来时 message 里可能还留着歌名，不要显示在编译页。 */
+            status = "idle";
+        }
+        if (status == NULL || status[0] == '\0') {
+            status = "idle";
+        }
         size_t i = 0;
         for (; status[i] != '\0' && i + 12 < sizeof(placeholder); i++) {
             placeholder[i] = (char)toupper((unsigned char)status[i]);

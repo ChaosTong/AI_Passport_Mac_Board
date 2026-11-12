@@ -1,5 +1,6 @@
 import Combine
 import CoreBluetooth
+import Darwin
 import Foundation
 import MacBoardBLE
 
@@ -73,8 +74,11 @@ public final class MacBoardBridge: NSObject, ObservableObject {
     private var keepaliveTimer: Timer?
     private var secureProbeTimer: Timer?
     private var musicPollTimer: Timer?
-    /// 编译中的兜底：30s 没收到 Birkin 推送就一次性核对 birkinStatus（不周期轮询）
+    /// 编译中的兜底：30s 没读到新进度就一次性核对 birkinStatus
     private var buildWatchdogTimer: Timer?
+    private var progressFileSource: DispatchSourceFileSystemObject?
+    private var progressPollTimer: Timer?
+    private var lastProgressFileError: String?
     private var lastBuildProgress: String?
     private var lastBuildProgressShape: String?
     private var lastBuildProgressAt: Date?
@@ -99,12 +103,7 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         self.central = NUSCentralManager(namePrefix: namePrefix)
         super.init()
         self.central.delegate = self
-        // Birkin（Hammerspoon）主动推送构建文案：分布式通知，零轮询
-        DistributedNotificationCenter.default().addObserver(
-            self, selector: #selector(onBirkinNotification(_:)),
-            name: birkinProgressNotification, object: nil,
-            suspensionBehavior: .deliverImmediately
-        )
+        startProgressFileWatcher()
     }
 
     public func bootstrap() {
@@ -356,11 +355,60 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         musicPollTimer = nil
     }
 
-    // MARK: - Birkin 推送
+    // MARK: - Birkin 进度文件
 
-    @objc private nonisolated func onBirkinNotification(_ note: Notification) {
-        guard let line = HammerspoonBuildService.progressLine(fromUserInfo: note.userInfo) else { return }
-        Task { @MainActor in self.handleBirkinLine(line, live: true) }
+    private func startProgressFileWatcher() {
+        let dir = birkinProgressFileURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fd = open(dir.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .attrib, .rename, .link, .delete],
+            queue: .main
+        )
+        src.setEventHandler { [weak self] in
+            self?.ingestProgressFile(live: true)
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        progressFileSource = src
+        appendLog("监听进度文件 \(birkinProgressFileURL.path)")
+        startProgressPolling()
+        ingestProgressFile(live: false)
+    }
+
+    /// 读 Birkin 写下的进度快照，把新行推进时间线，并写进菜单日志。
+    private func ingestProgressFile(live: Bool) {
+        let result = HammerspoonBuildService.readProgressFile(since: birkinSeq)
+        if let error = result.error, live {
+            // 避免每 0.5s 刷同一句
+            if lastProgressFileError != error {
+                lastProgressFileError = error
+                appendLog("进度文件读失败: \(error)")
+            }
+            return
+        }
+        lastProgressFileError = nil
+        guard let catchUp = result.value else { return }
+        for line in catchUp.lines {
+            handleBirkinLine(line, live: live)
+        }
+        // 只有没有新行时才处理 hidden，避免上一轮结束后的 hidden 把刚开始的编译取消掉
+        if catchUp.hidden, catchUp.lines.isEmpty {
+            handleBirkinLine(BirkinProgressLine(seq: 0, state: "hidden", text: ""), live: live)
+        }
+    }
+
+    private func startProgressPolling() {
+        guard progressPollTimer == nil else { return }
+        progressPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.ingestProgressFile(live: true) }
+        }
+    }
+
+    private func stopProgressPolling() {
+        progressPollTimer?.invalidate()
+        progressPollTimer = nil
     }
 
     private var isTrackingBuild: Bool {
@@ -404,10 +452,10 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         default:
             appendBirkinText(line.text, throttle: false)
         }
-        // 编译页实时推；结束态（成功 / 失败）在任何页面都推一次，让板子及时播放提示音
-        let finished = line.state == "success" || line.state == "failure"
-        if live, phase == .ready, activePage == .build || finished {
-            pushCurrentHeartbeat()
+        // 编译进度始终以 page=build 下发：板子只在编译页显示，不会被切页。
+        // 结束态带上 build_result，任意页都能播提示音（不等 Mac 先收到切页上报）。
+        if live, phase == .ready {
+            pushBuildHeartbeat()
         }
     }
 
@@ -425,6 +473,10 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         lastBuildProgressShape = shape
         lastBuildProgressAt = now
         appendBuildProcess(text)
+        appendLog("编译 \(text)")
+        if phase == .ready, activePage != .build {
+            appendLog("编译进度已下发；Mac 尚未收到切页上报，仍显示\(activePage.displayName)页并会推歌名")
+        }
     }
 
     private func finishBuild(_ status: BirkinBuildStatus, note: Bool) {
@@ -438,7 +490,7 @@ public final class MacBoardBridge: NSObject, ObservableObject {
             // 失败后一次性取错误摘要
             Task { @MainActor in
                 buildErrorLines = await buildService.errorLines()
-                if phase == .ready, activePage == .build { pushCurrentHeartbeat() }
+                if phase == .ready { pushBuildHeartbeat() }
             }
         } else if status == .success {
             buildErrorLines = []
@@ -461,13 +513,15 @@ public final class MacBoardBridge: NSObject, ObservableObject {
     private func buildWatchdogFired() async {
         buildWatchdogTimer = nil
         guard buildStatus.isBuilding else { return }
+        ingestProgressFile(live: true)
+        if !buildStatus.isBuilding { return }
         let status = await buildService.status()
         if status.isBuilding {
             armBuildWatchdog()
             return
         }
         finishBuild(status, note: true)
-        if phase == .ready { pushCurrentHeartbeat() }
+        if phase == .ready { pushBuildHeartbeat() }
     }
 
     private func stopTimers() {
@@ -478,7 +532,21 @@ public final class MacBoardBridge: NSObject, ObservableObject {
 
     private func pushCurrentHeartbeat() {
         guard phase == .ready else { return }
-        let snapshot = currentHeartbeatSnapshot()
+        sendHeartbeatSnapshot(currentHeartbeatSnapshot())
+    }
+
+    /// 只推编译页数据。板子不在编译页会忽略并上报当前页，Mac 不会因此改板子的页。
+    private func pushBuildHeartbeat() {
+        guard phase == .ready else { return }
+        var snapshot = buildHeartbeat()
+        if let finished = buildFinishedAt, buildStatus == .success || buildStatus == .failure {
+            snapshot.buildResult = buildStatus.rawValue
+            snapshot.buildId = Int(finished.timeIntervalSince1970 * 1000)
+        }
+        sendHeartbeatSnapshot(snapshot)
+    }
+
+    private func sendHeartbeatSnapshot(_ snapshot: HeartbeatSnapshot) {
         central.sendHeartbeat(snapshot) { [weak self] error in
             Task { @MainActor in
                 if let error {
@@ -596,8 +664,13 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         }
         if status.isBuilding, !isTrackingBuild {
             beginBuildTimeline(note: status.rawValue)
-            if let catchUp = await buildService.progressLines(since: 0) {
-                // 只补最近一段（从最后一次非 busy 之后开始）
+            if let catchUp = HammerspoonBuildService.readProgressFile(since: 0).value {
+                let tail = catchUp.lines.reversed().prefix { $0.state == "busy" || $0.state == "info" }
+                for line in tail.reversed() {
+                    handleBirkinLine(line, live: false)
+                }
+                birkinSeq = catchUp.latestSeq
+            } else if let catchUp = await buildService.progressLines(since: 0) {
                 let tail = catchUp.lines.reversed().prefix { $0.state == "busy" || $0.state == "info" }
                 for line in tail.reversed() {
                     handleBirkinLine(line, live: false)
@@ -605,12 +678,18 @@ public final class MacBoardBridge: NSObject, ObservableObject {
                 birkinSeq = catchUp.latestSeq
             }
             armBuildWatchdog()
+        } else if let catchUp = HammerspoonBuildService.readProgressFile(since: 0).value {
+            birkinSeq = catchUp.latestSeq
         } else if let catchUp = await buildService.progressLines(since: 0) {
             birkinSeq = catchUp.latestSeq
         }
         buildStatus = status.isBuilding ? .busy : status
-        if phase == .ready, activePage == .build {
-            pushCurrentHeartbeat()
+        if phase == .ready {
+            if activePage == .build {
+                pushCurrentHeartbeat()
+            } else if buildStatus.isBuilding || isTrackingBuild || !(buildProcessLines.isEmpty) {
+                pushBuildHeartbeat()
+            }
         }
     }
 
@@ -619,6 +698,7 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         buildFinishedAt = nil
         buildProcessLines = []
         lastBuildProgress = nil
+        startProgressPolling()
         if let note {
             appendBuildProcess(note)
         }
@@ -764,7 +844,7 @@ public final class MacBoardBridge: NSObject, ObservableObject {
         // 不切板子页面：编译结果 bres/bid 随任何页的 heartbeat 下发，提示音照样响
         sendAck(.build, ok: true, error: nil)
         pushCurrentHeartbeat()
-        // 之后的进度 / 结果全部由 Birkin 推送；只留 30s 兜底核对
+        // 之后的进度从 Birkin 进度文件读；只留 30s 兜底核对
         armBuildWatchdog()
     }
 

@@ -190,6 +190,8 @@ bool buddy_orchestrator_execute_action(buddy_state_t *state,
             length = buddy_protocol_media_json(json, sizeof(json), action->macboard_action);
         } else if (strcmp(action->macboard_cmd, "build") == 0) {
             length = buddy_protocol_build_json(json, sizeof(json), action->macboard_action);
+        } else if (strcmp(action->macboard_cmd, "page") == 0) {
+            length = buddy_protocol_page_json(json, sizeof(json), action->macboard_action);
         } else {
             return false;
         }

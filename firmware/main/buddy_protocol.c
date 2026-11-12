@@ -791,6 +791,11 @@ int buddy_protocol_build_json(char *json, size_t size, const char *action)
     return buddy_protocol_simple_cmd_json(json, size, "build", action);
 }
 
+int buddy_protocol_page_json(char *json, size_t size, const char *action)
+{
+    return buddy_protocol_simple_cmd_json(json, size, "page", action);
+}
+
 int buddy_protocol_device_status_json(char *json, size_t size,
                                       const buddy_status_report_t *status)
 {

@@ -35,8 +35,22 @@ public struct BirkinProgressLine: Sendable, Equatable {
     public let text: String
 }
 
-/// Birkin 分布式通知名（与 Birkin tools/hammerspoon/init.lua 的 MACBOARD_NOTE 一致）。
-public let birkinProgressNotification = Notification.Name("com.chaos.macboard.birkin")
+/// Birkin 写下的进度快照（与 tools/hammerspoon/init.lua 的 MACBOARD_PROGRESS_FILE 一致）。
+public let birkinProgressFileURL: URL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/MacBoard/birkin-progress.json")
+
+private struct BirkinProgressFile: Decodable {
+    var seq: Int?
+    var state: String?
+    var text: String?
+    var items: [Item]?
+
+    struct Item: Decodable {
+        var seq: Int
+        var state: String
+        var text: String
+    }
+}
 
 public struct HammerspoonBuildService: Sendable {
     public var hsExecutable: String
@@ -89,12 +103,30 @@ public struct HammerspoonBuildService: Sendable {
         return (latest, lines)
     }
 
-    /// 解析 Birkin 分布式通知的 userInfo（seq / state / text 都是字符串）。
-    public static func progressLine(fromUserInfo info: [AnyHashable: Any]?) -> BirkinProgressLine? {
-        guard let info, let state = info["state"] as? String else { return nil }
-        let seq = Int((info["seq"] as? String) ?? "") ?? 0
-        let text = cleanProgress((info["text"] as? String) ?? "") ?? ""
-        return BirkinProgressLine(seq: seq, state: state, text: text)
+    public struct ProgressFileRead: Sendable {
+        public var value: (latestSeq: Int, lines: [BirkinProgressLine], hidden: Bool)?
+        public var error: String?
+    }
+
+    /// 读取 Birkin 进度文件里 seq 之后的新文案。文件还不存在时 value 和 error 都是 nil。
+    public static func readProgressFile(since seq: Int) -> ProgressFileRead {
+        let url = birkinProgressFileURL
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return ProgressFileRead(value: nil, error: nil)
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            let file = try JSONDecoder().decode(BirkinProgressFile.self, from: data)
+            let latest = file.seq ?? file.items?.last?.seq ?? 0
+            var lines: [BirkinProgressLine] = []
+            for item in file.items ?? [] where item.seq > seq {
+                let text = cleanProgress(item.text) ?? ""
+                lines.append(BirkinProgressLine(seq: item.seq, state: item.state, text: text))
+            }
+            return ProgressFileRead(value: (latest, lines, file.state == "hidden"), error: nil)
+        } catch {
+            return ProgressFileRead(value: nil, error: error.localizedDescription)
+        }
     }
 
     static func cleanProgress(_ text: String) -> String? {
